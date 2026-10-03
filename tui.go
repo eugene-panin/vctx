@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"maps"
-	"os"
 	"os/exec"
 	"slices"
 	"strings"
@@ -76,6 +75,7 @@ type model struct {
 	flash   string
 	flashOK bool
 	chosen  string
+	tokens  map[string]bool // cached: with the keychain every lookup is a process
 }
 
 func newModel(a *app, cfg *config) (*model, error) {
@@ -114,7 +114,16 @@ func newModel(a *app, cfg *config) (*model, error) {
 			probing: true,
 		})
 	}
+	m.refreshTokens()
 	return m, nil
+}
+
+func (m *model) refreshTokens() {
+	names := make([]string, len(m.rows))
+	for i, r := range m.rows {
+		names[i] = r.name
+	}
+	m.tokens = m.a.tokenStatus(names)
 }
 
 func (m *model) Init() tea.Cmd {
@@ -161,6 +170,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.flash = fmt.Sprintf("%s: %v", msg.what, msg.err)
 		}
+		m.refreshTokens()
 		return m, tea.Batch(m.spin.Tick, m.probe(msg.i))
 	case tea.KeyMsg:
 		return m.handleKey(msg)
@@ -206,15 +216,19 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, m.run(m.cursor, "shell", sh)
 	case key.Matches(msg, keys.Logout):
-		err := os.Remove(m.a.tokenPath(r.name))
+		store, err := m.a.tokens()
+		if err == nil && m.tokens[r.name] {
+			err = store.del(r.name)
+		}
 		switch {
-		case errors.Is(err, os.ErrNotExist):
-			m.flash, m.flashOK = r.name+": no stored token", false
 		case err != nil:
 			m.flash, m.flashOK = err.Error(), false
+		case !m.tokens[r.name]:
+			m.flash, m.flashOK = r.name+": no stored token", false
 		default:
 			m.flash, m.flashOK = r.name+": token forgotten", true
 		}
+		m.refreshTokens()
 	}
 	return m, nil
 }
@@ -295,7 +309,7 @@ func (m *model) tableView(width, height int) string {
 	for i, r := range m.rows {
 		statuses[i] = r.status
 	}
-	cols, levels := m.a.statusColumns(statuses, m.current)
+	cols, levels := statusColumns(statuses, m.current, m.tokens)
 	for i, r := range m.rows {
 		if r.probing {
 			cols[3].cells[i] = "checking"
@@ -388,7 +402,7 @@ func (m *model) detailView(width, height int) string {
 		b.WriteString(label("status") + m.p.level(lvl).Render(text) + m.p.dim.Render("  "+r.status.latencyText()) + "\n")
 	}
 
-	if m.a.hasToken(r.name) {
+	if m.tokens[r.name] {
 		b.WriteString(label("token") + m.p.ok.Render("✓ stored") + "\n")
 	} else {
 		b.WriteString(label("token") + m.p.dim.Render("none, press l to log in") + "\n")

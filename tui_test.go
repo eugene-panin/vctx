@@ -118,6 +118,7 @@ func TestForgetToken(t *testing.T) {
 	if err := writeFileAtomic(a.tokenPath("dev"), []byte("t"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	m.refreshTokens() // as after a login
 	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
 	if _, err := os.Stat(a.tokenPath("dev")); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("token still present: %v", err)

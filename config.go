@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"syscall"
 
 	"gopkg.in/yaml.v3"
 )
@@ -32,6 +33,9 @@ func loadConfig(path string) (*config, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
+	}
+	if err := checkPrivate(path); err != nil {
+		return nil, err
 	}
 	var c config
 	dec := yaml.NewDecoder(bytes.NewReader(b))
@@ -58,6 +62,23 @@ func loadConfig(path string) (*config, error) {
 		}
 	}
 	return &c, nil
+}
+
+// checkPrivate refuses a file or directory another user could modify, as ssh does:
+// the config decides which variables (PATH included) vault runs with, and the
+// state directory holds the token helper setting vault executes.
+func checkPrivate(path string) error {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if perm := fi.Mode().Perm(); perm&0o022 != 0 {
+		return fmt.Errorf("%s is writable by group or others (mode %04o), fix with: chmod go-w %s", path, perm, path)
+	}
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok && int(st.Uid) != os.Getuid() {
+		return fmt.Errorf("%s is owned by another user", path)
+	}
+	return nil
 }
 
 func checkVars(vars map[string]string) error {

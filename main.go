@@ -54,9 +54,13 @@ seconds. VCTX_CHECK_TIMEOUT sets the timeout (default 3s), 0 disables it.
 Inherited VAULT_* variables are dropped before a context is applied, so an
 address or token of one instance never leaks into another.
 
-Tokens from 'vault login' are stored per context under $VCTX_STATE_DIR/tokens
-(default ~/.local/state/vctx): vctx sets VAULT_CONFIG_PATH to a generated
-config that registers vctx itself as the Vault token helper.
+Tokens from 'vault login' are stored per context and bound to the address
+they were issued for: in the macOS Keychain by default, in files under
+$VCTX_STATE_DIR/tokens (default ~/.local/state/vctx) elsewhere; set
+VCTX_TOKEN_STORE=file or keychain to choose. vctx sets VAULT_CONFIG_PATH to a
+generated config that registers vctx itself as the Vault token helper.
+
+The config and the state directory must not be writable by other users.
 `
 
 type app struct {
@@ -69,6 +73,7 @@ type app struct {
 	stdout     io.Writer
 	stderr     io.Writer
 	exec       func(argv0 string, argv, envv []string) error
+	keyring    secretService // nil means the system keychain
 }
 
 func main() {
@@ -197,10 +202,11 @@ func (a *app) run(args []string) error {
 		if _, ok := cfg.Contexts[name]; !ok {
 			return fmt.Errorf("unknown context %q", name)
 		}
-		if err := os.Remove(a.tokenPath(name)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		store, err := a.tokens()
+		if err != nil {
 			return err
 		}
-		return nil
+		return store.del(name)
 	case "exec":
 		name, argv := splitExec(rest)
 		if len(argv) == 0 {
@@ -278,15 +284,17 @@ func (a *app) list() error {
 		return err
 	}
 	current, _ := a.contextName("")
+	names := slices.Sorted(maps.Keys(cfg.Contexts))
+	tokens := a.tokenStatus(names)
 	tw := tabwriter.NewWriter(a.stdout, 0, 4, 2, ' ', 0)
-	for _, name := range slices.Sorted(maps.Keys(cfg.Contexts)) {
+	for _, name := range names {
 		vars := cfg.Contexts[name]
 		mark := " "
 		if name == current {
 			mark = "*"
 		}
 		token := "-"
-		if a.hasToken(name) {
+		if tokens[name] {
 			token = "token"
 		}
 		ns := vars["VAULT_NAMESPACE"]

@@ -228,3 +228,26 @@ func TestConfigErrorHasNoVPNHint(t *testing.T) {
 		t.Error("command ran despite a broken config")
 	}
 }
+
+func TestServerTextSanitized(t *testing.T) {
+	body := `{"initialized":true,"sealed":false,"version":"1.0\u001b]0;PWNED\u0007\u001b[2J"}`
+	r := probe(t.Context(), []string{"VAULT_ADDR=" + serve(t, vaultHandler(200, body))}, defaultCheckTimeout)
+	if r.err != nil {
+		t.Fatal(r.err)
+	}
+	if strings.ContainsAny(r.health.Version, "\x1b\x07") || r.health.Version != "1.0]0;PWNED[2J" {
+		t.Errorf("version = %q", r.health.Version)
+	}
+	if got := sanitize(strings.Repeat("a", 50), 40); got != strings.Repeat("a", 40)+"…" {
+		t.Errorf("long text: %q", got)
+	}
+}
+
+func TestRedirectReported(t *testing.T) {
+	addr := serve(t, http.RedirectHandler("https://sso.example.com/login", http.StatusFound))
+	r := probe(t.Context(), []string{"VAULT_ADDR=" + addr}, defaultCheckTimeout)
+	short, long := classify(r.err)
+	if short != "blocked (HTTP 302)" || !strings.Contains(long, "redirect to sso.example.com") {
+		t.Errorf("short %q, long %q", short, long)
+	}
+}

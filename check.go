@@ -20,6 +20,7 @@ import (
 	"sync"
 	"text/tabwriter"
 	"time"
+	"unicode"
 
 	"golang.org/x/net/http/httpproxy"
 )
@@ -191,14 +192,37 @@ func (h health) String() string {
 }
 
 // notVaultError means something answered at VAULT_ADDR, but not the Vault API:
-// typically an ingress or firewall rejecting the client's IP.
+// typically an ingress or firewall rejecting the client's IP, or redirecting to a login page.
 type notVaultError struct {
 	status      int
 	contentType string
+	location    string
 }
 
 func (e *notVaultError) Error() string {
+	if e.location != "" {
+		return fmt.Sprintf("HTTP %d redirect to %s, not the Vault API", e.status, e.location)
+	}
 	return fmt.Sprintf("HTTP %d (%s), not the Vault API", e.status, e.contentType)
+}
+
+// sanitize makes text from a server or certificate safe to print: control
+// characters would let it drive the terminal (retitle, clear, write the clipboard).
+func sanitize(s string, limit int) string {
+	var b strings.Builder
+	n := 0
+	for _, r := range s {
+		if !unicode.IsPrint(r) {
+			continue
+		}
+		if n == limit {
+			b.WriteRune('…')
+			break
+		}
+		b.WriteRune(r)
+		n++
+	}
+	return b.String()
 }
 
 type probeResult struct {
@@ -229,7 +253,13 @@ func probe(ctx context.Context, env []string, timeout time.Duration) probeResult
 			return d.DialContext(ctx, "unix", t.unix)
 		}
 	}
-	client := &http.Client{Transport: tr, Timeout: timeout}
+	client := &http.Client{
+		Transport: tr,
+		Timeout:   timeout,
+		// A redirect is reported, not followed: Vault never redirects sys/health,
+		// and following would present a client certificate to whatever host it names.
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, t.addr.JoinPath("v1/sys/health").String(), nil)
 	if err != nil {
@@ -243,9 +273,12 @@ func probe(ctx context.Context, env []string, timeout time.Duration) probeResult
 	defer resp.Body.Close()
 	latency := time.Since(start)
 
-	notVault := &notVaultError{status: resp.StatusCode, contentType: resp.Header.Get("Content-Type")}
+	notVault := &notVaultError{status: resp.StatusCode, contentType: sanitize(resp.Header.Get("Content-Type"), 40)}
 	if notVault.contentType == "" {
 		notVault.contentType = "no content type"
+	}
+	if loc, err := resp.Location(); err == nil {
+		notVault.location = sanitize(loc.Host, 60)
 	}
 	switch resp.StatusCode {
 	case 200, 429, 472, 473, 501, 503:
@@ -256,6 +289,7 @@ func probe(ctx context.Context, env []string, timeout time.Duration) probeResult
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&h); err != nil || h.Initialized == nil {
 		return probeResult{err: notVault}
 	}
+	h.Version = sanitize(h.Version, 40)
 	return probeResult{health: &h, latency: latency}
 }
 
@@ -274,6 +308,11 @@ func reason(err error) string {
 
 // classify describes err twice: a compact label for tables and a full explanation.
 func classify(err error) (short, long string) {
+	short, long = describe(err)
+	return short, sanitize(long, 300)
+}
+
+func describe(err error) (short, long string) {
 	var nv *notVaultError
 	var dnsErr *net.DNSError
 	var recErr tls.RecordHeaderError

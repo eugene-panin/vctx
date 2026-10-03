@@ -78,9 +78,10 @@ func applyEnv(environ []string, vars map[string]string) []string {
 }
 
 // writeShellEnv prints POSIX shell commands that turn environ into the environment applyEnv would build.
+// The output is eval'd, so inherited names that are not plain identifiers are skipped.
 func writeShellEnv(w io.Writer, environ []string, vars map[string]string) {
 	for _, k := range slices.Sorted(maps.Keys(managedKeys(environ))) {
-		if _, ok := vars[k]; !ok {
+		if _, ok := vars[k]; !ok && envKeyRe.MatchString(k) {
 			fmt.Fprintf(w, "unset %s\n", k)
 		}
 	}
@@ -98,6 +99,12 @@ func (a *app) writeVaultConfig() (string, error) {
 	// Vault runs the helper through "sh -c '<path> <op>'".
 	if strings.ContainsAny(a.self, " \t\n'\"\\$`;&|<>()*?[]") {
 		return "", fmt.Errorf("vctx binary path %q is not usable as a vault token helper, move it to a plain path", a.self)
+	}
+	if err := os.MkdirAll(a.stateDir, 0o700); err != nil {
+		return "", err
+	}
+	if err := checkPrivate(a.stateDir); err != nil {
+		return "", err
 	}
 	path := filepath.Join(a.stateDir, "vault.hcl")
 	content := fmt.Sprintf("token_helper = %q\n", a.self)

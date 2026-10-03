@@ -42,7 +42,7 @@ func newTestApp(t *testing.T, environ ...string) (*app, *bytes.Buffer, *execCall
 		configPath: cfg,
 		stateDir:   filepath.Join(dir, "state"),
 		self:       "/usr/local/bin/vctx",
-		environ:    append([]string{"PATH=" + os.Getenv("PATH"), "VCTX_VAULT_BIN=/bin/sh", "VCTX_CHECK_TIMEOUT=0"}, environ...),
+		environ:    append([]string{"PATH=" + os.Getenv("PATH"), "VCTX_VAULT_BIN=/bin/sh", "VCTX_CHECK_TIMEOUT=0", "VCTX_TOKEN_STORE=file"}, environ...),
 		stdin:      strings.NewReader(""),
 		stdout:     &out,
 		stderr:     &bytes.Buffer{},
@@ -289,5 +289,44 @@ func TestIsTerminalDevNull(t *testing.T) {
 	defer f.Close()
 	if isTerminal(f) {
 		t.Error("/dev/null detected as a terminal")
+	}
+}
+
+func TestShellEnvSkipsUnsafeNames(t *testing.T) {
+	a, out, _ := newTestApp(t, "VAULT_x;echo pwned=1", "VCTX_VARS=a;id OK_NAME")
+	if err := a.run([]string{"env", "--clear"}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out.String(), ";") {
+		t.Errorf("unsafe name reached eval output:\n%s", out)
+	}
+	if !strings.Contains(out.String(), "unset OK_NAME\n") {
+		t.Errorf("valid name dropped:\n%s", out)
+	}
+}
+
+func TestPrivatePaths(t *testing.T) {
+	a, _, _ := newTestApp(t)
+	if err := os.Chmod(a.configPath, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.run([]string{"ls"}); err == nil || !strings.Contains(err.Error(), "writable by group or others") {
+		t.Errorf("group-writable config: %v", err)
+	}
+	if err := os.Chmod(a.configPath, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.run([]string{"ls"}); err != nil {
+		t.Errorf("0644 config: %v", err)
+	}
+
+	if err := os.MkdirAll(a.stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(a.stateDir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.run([]string{"dev", "status"}); err == nil || !strings.Contains(err.Error(), "writable by group or others") {
+		t.Errorf("world-writable state dir: %v", err)
 	}
 }

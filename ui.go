@@ -96,7 +96,7 @@ func (a *app) withSpinner(title string, fn func() []contextStatus) []contextStat
 }
 
 // statusColumns lays out contexts as table columns; the first is the current-context marker.
-func (a *app) statusColumns(statuses []contextStatus, current string) ([]column, []level) {
+func statusColumns(statuses []contextStatus, current string, tokens map[string]bool) ([]column, []level) {
 	cols := []column{
 		{header: ""},
 		{header: "CONTEXT", min: 8, shrink: 4},
@@ -114,7 +114,7 @@ func (a *app) statusColumns(statuses []contextStatus, current string) ([]column,
 		if s.name == current {
 			mark = "●"
 		}
-		if a.hasToken(s.name) {
+		if tokens[s.name] {
 			token = "✓"
 		}
 		for c, v := range []string{mark, s.name, s.display, text, s.latencyText(), token} {
@@ -126,7 +126,11 @@ func (a *app) statusColumns(statuses []contextStatus, current string) ([]column,
 
 func (a *app) renderStatusTable(statuses []contextStatus, current string) string {
 	p := newPalette(a.stdout)
-	cols, levels := a.statusColumns(statuses, current)
+	names := make([]string, len(statuses))
+	for i, s := range statuses {
+		names[i] = s.name
+	}
+	cols, levels := statusColumns(statuses, current, a.tokenStatus(names))
 	width := terminalWidth(a.stdout)
 	if width <= 0 {
 		width = 100
@@ -184,11 +188,6 @@ func (a *app) renderStatusTable(statuses []contextStatus, current string) string
 		b.WriteString(p.dim.Render("  is the VPN/tunnel up?") + "\n")
 	}
 	return strings.TrimSuffix(b.String(), "\n")
-}
-
-func (a *app) hasToken(name string) bool {
-	_, err := os.Stat(a.tokenPath(name))
-	return err == nil
 }
 
 func (a *app) printUsing(name string, cfg *config) {
