@@ -69,7 +69,9 @@ func TestLoadConfigErrors(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			p := filepath.Join(t.TempDir(), "c.yaml")
-			os.WriteFile(p, []byte(tc.yaml), 0o600)
+			if err := os.WriteFile(p, []byte(tc.yaml), 0o600); err != nil {
+				t.Fatal(err)
+			}
 			_, err := loadConfig(p)
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("err = %v, want %q", err, tc.want)
@@ -226,5 +228,66 @@ func TestVaultConfigRejectsUnsafePath(t *testing.T) {
 	a.self = "/Users/me/My Tools/vctx"
 	if err := a.run([]string{"dev", "status"}); err == nil {
 		t.Fatal("expected error for helper path with a space")
+	}
+}
+
+func TestTokenBoundToAddress(t *testing.T) {
+	a, out, _ := newTestApp(t)
+	base := a.environ
+	helper := func(op, input string, env ...string) string {
+		t.Helper()
+		out.Reset()
+		a.environ = append(slices.Clip(base), env...)
+		a.stdin = strings.NewReader(input)
+		if err := a.run([]string{op}); err != nil {
+			t.Fatal(err)
+		}
+		return out.String()
+	}
+
+	helper("store", "tok", "VCTX_CONTEXT=dev", "VAULT_ADDR=https://vault.example.com/")
+	if got := helper("get", "", "VCTX_CONTEXT=dev", "VAULT_ADDR=https://vault.example.com"); got != "tok" {
+		t.Errorf("same address: %q", got)
+	}
+	if got := helper("get", "", "VCTX_CONTEXT=dev", "VAULT_ADDR=https://evil.example.com"); got != "" {
+		t.Errorf("token handed to another address: %q", got)
+	}
+
+	if err := os.WriteFile(a.tokenPath("prod"), []byte("legacy\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := helper("get", "", "VCTX_CONTEXT=prod", "VAULT_ADDR=https://anything"); got != "legacy" {
+		t.Errorf("legacy token file: %q", got)
+	}
+}
+
+func TestContextNameRejectsPaths(t *testing.T) {
+	a, _, _ := newTestApp(t)
+	victim := filepath.Join(filepath.Dir(a.stateDir), "victim")
+	if err := os.WriteFile(victim, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"logout", "../../victim"}, {"logout", "nope"}} {
+		if err := a.run(args); err == nil {
+			t.Errorf("%v succeeded", args)
+		}
+	}
+	a.environ = append(a.environ, "VCTX_CONTEXT=../../victim")
+	if err := a.run([]string{"logout"}); err == nil || !strings.Contains(err.Error(), "invalid context name") {
+		t.Errorf("logout with bad $VCTX_CONTEXT: %v", err)
+	}
+	if _, err := os.Stat(victim); err != nil {
+		t.Errorf("file outside the token directory was touched: %v", err)
+	}
+}
+
+func TestIsTerminalDevNull(t *testing.T) {
+	f, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if isTerminal(f) {
+		t.Error("/dev/null detected as a terminal")
 	}
 }

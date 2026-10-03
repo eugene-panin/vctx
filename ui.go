@@ -24,11 +24,7 @@ var (
 
 func isTerminal(v any) bool {
 	f, ok := v.(*os.File)
-	if !ok {
-		return false
-	}
-	fi, err := f.Stat()
-	return err == nil && fi.Mode()&os.ModeCharDevice != 0
+	return ok && term.IsTerminal(f.Fd())
 }
 
 func terminalWidth(w io.Writer) int {
@@ -169,7 +165,7 @@ func (a *app) renderStatusTable(statuses []contextStatus, current string) string
 		})
 	}
 
-	var failed bool
+	var failed, network bool
 	for i, s := range statuses {
 		if s.err == nil {
 			continue
@@ -178,12 +174,13 @@ func (a *app) renderStatusTable(statuses []contextStatus, current string) string
 			b.WriteString("\n")
 			failed = true
 		}
+		network = network || networkProblem(s.err)
 		_, long := classify(s.err)
 		text := lipgloss.NewStyle().Width(max(width-2, 20)).Render(s.name + " " + long)
 		name, rest, _ := strings.Cut(text, " ")
 		fmt.Fprintf(&b, "%s %s %s\n", p.level(levels[i]).Render("✗"), p.bold.Render(name), p.dim.Render(strings.ReplaceAll(rest, "\n", "\n  ")))
 	}
-	if failed {
+	if network {
 		b.WriteString(p.dim.Render("  is the VPN/tunnel up?") + "\n")
 	}
 	return strings.TrimSuffix(b.String(), "\n")
@@ -196,12 +193,19 @@ func (a *app) hasToken(name string) bool {
 
 func (a *app) printUsing(name string, cfg *config) {
 	addr := cfg.Contexts[name]["VAULT_ADDR"]
+	override := a.shellOverride(name)
 	if !isTerminal(a.stderr) {
 		fmt.Fprintf(a.stderr, "using %s (%s)\n", name, addr)
+		if override != "" {
+			fmt.Fprintf(a.stderr, "note: this shell has %s=%s, it takes precedence\n", envContext, override)
+		}
 		return
 	}
 	p := newPalette(a.stderr)
 	fmt.Fprintf(a.stderr, "%s %s %s\n", p.accent.Render("●"), p.bold.Render(name), p.dim.Render(addr))
+	if override != "" {
+		fmt.Fprintln(a.stderr, p.warn.Render(fmt.Sprintf("  this shell has %s=%s, it takes precedence here", envContext, override)))
+	}
 	// Shown once: the alias is the missing piece for plain `vault` to follow `vctx use`.
 	marker := filepath.Join(a.stateDir, "hint-alias")
 	if _, err := os.Stat(marker); errors.Is(err, fs.ErrNotExist) {

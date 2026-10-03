@@ -213,3 +213,18 @@ func TestCheckCommand(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestConfigErrorHasNoVPNHint(t *testing.T) {
+	a, _, call := newTestApp(t, "VCTX_CHECK_TIMEOUT=2s")
+	cfg := "contexts:\n  x:\n    VAULT_ADDR: " + serve(t, vaultHandler(200, activeBody)) + "\n    VAULT_CACERT: /nonexistent/ca.pem\n"
+	if err := os.WriteFile(a.configPath, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := a.run([]string{"x", "status"})
+	if err == nil || !strings.Contains(err.Error(), "CA certificate") || strings.Contains(err.Error(), "VPN") {
+		t.Fatalf("err = %v", err)
+	}
+	if call.argv0 != "" {
+		t.Error("command ran despite a broken config")
+	}
+}

@@ -190,6 +190,13 @@ func (a *app) run(args []string) error {
 		if err != nil {
 			return err
 		}
+		cfg, err := a.loadConfig()
+		if err != nil {
+			return err
+		}
+		if _, ok := cfg.Contexts[name]; !ok {
+			return fmt.Errorf("unknown context %q", name)
+		}
 		if err := os.Remove(a.tokenPath(name)); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return err
 		}
@@ -208,11 +215,7 @@ func (a *app) run(args []string) error {
 		if _, ok := cfg.Contexts[cmd]; !ok {
 			return fmt.Errorf("unknown command or context %q, see 'vctx help'", cmd)
 		}
-		bin := a.getenv("VCTX_VAULT_BIN")
-		if bin == "" {
-			bin = "vault"
-		}
-		return a.execWith(cfg, cmd, append([]string{bin}, rest...))
+		return a.execWith(cfg, cmd, append([]string{a.vaultBin()}, rest...))
 	}
 }
 
@@ -231,6 +234,13 @@ func splitExec(args []string) (string, []string) {
 	return name, argv
 }
 
+func (a *app) vaultBin() string {
+	if bin := a.getenv("VCTX_VAULT_BIN"); bin != "" {
+		return bin
+	}
+	return "vault"
+}
+
 func (a *app) loadConfig() (*config, error) {
 	return loadConfig(a.configPath)
 }
@@ -240,21 +250,26 @@ func (a *app) currentFile() string {
 }
 
 // contextName resolves the context: explicit argument, then $VCTX_CONTEXT, then the saved default.
+// The name ends up in file paths, so it is validated whatever its source.
 func (a *app) contextName(arg string) (string, error) {
-	if arg != "" {
-		return arg, nil
+	name, from := arg, "argument"
+	if name == "" {
+		name, from = a.getenv(envContext), "$"+envContext
 	}
-	if name := a.getenv(envContext); name != "" {
-		return name, nil
+	if name == "" {
+		b, err := os.ReadFile(a.currentFile())
+		if errors.Is(err, fs.ErrNotExist) {
+			return "", errors.New("no context selected: pass a name or run 'vctx use <context>'")
+		}
+		if err != nil {
+			return "", err
+		}
+		name, from = strings.TrimSpace(string(b)), a.currentFile()
 	}
-	b, err := os.ReadFile(a.currentFile())
-	if errors.Is(err, fs.ErrNotExist) {
-		return "", errors.New("no context selected: pass a name or run 'vctx use <context>'")
+	if !nameRe.MatchString(name) {
+		return "", fmt.Errorf("invalid context name %q in %s", name, from)
 	}
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(string(b)), nil
+	return name, nil
 }
 
 func (a *app) list() error {
@@ -290,10 +305,15 @@ func (a *app) use(cfg *config, name string) error {
 	if err := writeFileAtomic(a.currentFile(), []byte(name+"\n"), 0o600); err != nil {
 		return fmt.Errorf("save current context: %w", err)
 	}
-	if shell := a.getenv(envContext); shell != "" && shell != name {
-		fmt.Fprintf(a.stderr, "note: this shell has %s=%s, it takes precedence\n", envContext, shell)
-	}
 	return nil
+}
+
+// shellOverride returns the $VCTX_CONTEXT of this shell when it differs from name.
+func (a *app) shellOverride(name string) string {
+	if shell := a.getenv(envContext); shell != name {
+		return shell
+	}
+	return ""
 }
 
 func (a *app) env(args []string) error {

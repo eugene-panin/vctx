@@ -28,16 +28,24 @@ func (a *app) tokenFile() string {
 	if name := a.getenv(envContext); nameRe.MatchString(name) {
 		return a.tokenPath(name)
 	}
+	sum := sha256.Sum256([]byte(a.vaultAddr() + "\x00" + a.getenv("VAULT_NAMESPACE")))
+	return filepath.Join(a.stateDir, "tokens", "by-addr", hex.EncodeToString(sum[:12]))
+}
+
+// vaultAddr is the address the calling vault process talks to.
+func (a *app) vaultAddr() string {
 	addr := a.getenv("VAULT_ADDR")
 	if addr == "" {
 		addr = defaultVaultAddr
 	}
-	sum := sha256.Sum256([]byte(addr + "\x00" + a.getenv("VAULT_NAMESPACE")))
-	return filepath.Join(a.stateDir, "tokens", "by-addr", hex.EncodeToString(sum[:12]))
+	return strings.TrimRight(addr, "/")
 }
 
 // tokenHelper implements the Vault token helper protocol:
 // https://developer.hashicorp.com/vault/docs/commands/token-helper
+//
+// A token file holds the address it was issued for and the token, one per line,
+// so a token is never handed to vault talking to a different address.
 func (a *app) tokenHelper(op string) error {
 	path := a.tokenFile()
 	switch op {
@@ -49,14 +57,21 @@ func (a *app) tokenHelper(op string) error {
 		if err != nil {
 			return err
 		}
-		_, err = io.WriteString(a.stdout, strings.TrimSpace(string(b)))
+		addr, token, bound := strings.Cut(strings.TrimSpace(string(b)), "\n")
+		if !bound {
+			token = addr // written before tokens were bound to an address
+		} else if addr != a.vaultAddr() {
+			fmt.Fprintf(a.stderr, "vctx: stored token is for %s, not %s; not using it\n", addr, a.vaultAddr())
+			return nil
+		}
+		_, err = io.WriteString(a.stdout, strings.TrimSpace(token))
 		return err
 	case "store":
 		b, err := io.ReadAll(io.LimitReader(a.stdin, 64<<10))
 		if err != nil {
 			return fmt.Errorf("read token: %w", err)
 		}
-		return writeFileAtomic(path, []byte(strings.TrimSpace(string(b))), 0o600)
+		return writeFileAtomic(path, []byte(a.vaultAddr()+"\n"+strings.TrimSpace(string(b))+"\n"), 0o600)
 	case "erase":
 		if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return err

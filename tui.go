@@ -45,10 +45,12 @@ type row struct {
 	env     []string
 	status  contextStatus
 	probing bool
+	gen     int // bumped per probe so a late answer from an older one is ignored
 }
 
 type probeMsg struct {
 	i   int
+	gen int
 	res probeResult
 }
 
@@ -125,9 +127,10 @@ func (m *model) Init() tea.Cmd {
 
 func (m *model) probe(i int) tea.Cmd {
 	m.rows[i].probing = true
-	env, timeout := m.rows[i].env, m.timeout
+	m.rows[i].gen++
+	env, gen, timeout := m.rows[i].env, m.rows[i].gen, m.timeout
 	return func() tea.Msg {
-		return probeMsg{i: i, res: probe(context.Background(), env, timeout)}
+		return probeMsg{i: i, gen: gen, res: probe(context.Background(), env, timeout)}
 	}
 }
 
@@ -148,8 +151,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.spin, cmd = m.spin.Update(msg)
 		return m, cmd
 	case probeMsg:
-		m.rows[msg.i].probing = false
-		m.rows[msg.i].status.probeResult = msg.res
+		if r := &m.rows[msg.i]; msg.gen == r.gen {
+			r.probing = false
+			r.status.probeResult = msg.res
+		}
 	case execDoneMsg:
 		m.flashOK = msg.err == nil
 		m.flash = msg.what + " finished"
@@ -193,7 +198,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.flash = ""
 		return m, tea.Batch(cmds...)
 	case key.Matches(msg, keys.Login):
-		return m, m.run(m.cursor, "login", m.vaultBin(), "login")
+		return m, m.run(m.cursor, "login", m.a.vaultBin(), "login")
 	case key.Matches(msg, keys.Shell):
 		sh := m.a.getenv("SHELL")
 		if sh == "" {
@@ -212,13 +217,6 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
-}
-
-func (m *model) vaultBin() string {
-	if bin := m.a.getenv("VCTX_VAULT_BIN"); bin != "" {
-		return bin
-	}
-	return "vault"
 }
 
 // run suspends the UI and runs a command in the terminal with the context's environment.
@@ -266,6 +264,9 @@ func (m *model) headerView() string {
 	current := m.p.dim.Render("no default context")
 	if m.current != "" {
 		current = m.p.dim.Render("default ") + m.p.bold.Render(m.current)
+	}
+	if shell := m.a.getenv(envContext); shell != "" {
+		current = m.p.dim.Render("this shell ") + m.p.warn.Render(shell) + m.p.dim.Render(" ($"+envContext+")")
 	}
 	ok, done := 0, 0
 	for _, r := range m.rows {

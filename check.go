@@ -326,12 +326,26 @@ func (a *app) ensureReachable(name string, env []string) error {
 		return err
 	}
 	r := probe(context.Background(), env, timeout)
-	if r.err == nil || isTLSError(r.err) {
+	switch {
+	case r.err == nil || isTLSError(r.err):
 		return nil
+	case !networkProblem(r.err):
+		return fmt.Errorf("context %s: %w", name, r.err)
 	}
 	t, _ := targetFor(env)
 	return fmt.Errorf("context %s: %s %s\n"+
 		"is the VPN/tunnel up? set VCTX_CHECK_TIMEOUT=0 to skip this check", name, t, reason(r.err))
+}
+
+// networkProblem reports whether err comes from the network path to Vault
+// rather than from the local configuration.
+func networkProblem(err error) bool {
+	var nv *notVaultError
+	var opErr *net.OpError
+	var dnsErr *net.DNSError
+	var netErr net.Error
+	return errors.As(err, &nv) || errors.As(err, &opErr) || errors.As(err, &dnsErr) ||
+		errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &netErr) && netErr.Timeout())
 }
 
 // contextStatus is the probe outcome of one context.

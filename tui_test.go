@@ -126,3 +126,18 @@ func TestForgetToken(t *testing.T) {
 		t.Errorf("flash = %q", m.flash)
 	}
 }
+
+func TestStaleProbeIgnored(t *testing.T) {
+	m, _ := newTestModel(t)
+	m.probe(0)
+	stale := m.rows[0].gen
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
+	m.Update(probeMsg{i: 0, gen: stale, res: probeResult{err: errors.New("old")}})
+	if !m.rows[0].probing || m.rows[0].status.err != nil {
+		t.Errorf("stale answer applied: probing=%v err=%v", m.rows[0].probing, m.rows[0].status.err)
+	}
+	m.Update(probeMsg{i: 0, gen: m.rows[0].gen, res: probeResult{err: errors.New("new")}})
+	if m.rows[0].probing || m.rows[0].status.err == nil || m.rows[0].status.err.Error() != "new" {
+		t.Errorf("current answer not applied: probing=%v err=%v", m.rows[0].probing, m.rows[0].status.err)
+	}
+}
