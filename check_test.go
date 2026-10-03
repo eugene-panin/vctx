@@ -5,6 +5,7 @@ import (
 	"encoding/pem"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -434,6 +435,91 @@ func TestProxyCredentialsNotShown(t *testing.T) {
 		}
 		if strings.Contains(shown, "s3cret") {
 			t.Errorf("%q: password in %q", env, shown)
+		}
+	}
+}
+
+func TestPlainHTTPToTLSServer(t *testing.T) {
+	srv := httptest.NewUnstartedServer(vaultHandler(200, activeBody))
+	srv.Config.ErrorLog = log.New(io.Discard, "", 0)
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+	r := probeEnv(t, []string{"VAULT_ADDR=" + strings.Replace(srv.URL, "https://", "http://", 1)})
+	short, long := classify(r.err)
+	if short != "config error" || !strings.Contains(long, "use https://") || networkProblem(r.err) {
+		t.Errorf("short %q, long %q", short, long)
+	}
+}
+
+// connectProxy tunnels CONNECT requests to whatever host they name.
+func connectProxy(t *testing.T) string {
+	t.Helper()
+	return serve(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodConnect {
+			http.Error(w, "CONNECT only", http.StatusMethodNotAllowed)
+			return
+		}
+		upstream, err := net.Dial("tcp", r.Host)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		conn, buf, err := http.NewResponseController(w).Hijack()
+		if err != nil {
+			upstream.Close()
+			return
+		}
+		go func() { io.Copy(upstream, buf); upstream.Close() }()
+		io.Copy(conn, upstream)
+		conn.Close()
+	}))
+}
+
+func TestNotTLSThroughProxy(t *testing.T) {
+	plain := strings.Replace(serve(t, vaultHandler(200, activeBody)), "http://", "https://", 1)
+	r := probeEnv(t, []string{"VAULT_ADDR=" + plain, "VAULT_PROXY_ADDR=" + connectProxy(t)})
+	if short, long := classify(r.err); short != "not tls" {
+		t.Errorf("short %q, long %q", short, long)
+	}
+}
+
+func TestConnectionClosed(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			conn.Close()
+		}
+	}()
+	r := probeEnv(t, []string{"VAULT_ADDR=http://" + ln.Addr().String()})
+	if short, long := classify(r.err); short != "unreachable" || !strings.Contains(long, "connection closed") || !networkProblem(r.err) {
+		t.Errorf("short %q, long %q", short, long)
+	}
+}
+
+func TestAgentAddrNamedInErrors(t *testing.T) {
+	_, err := targetFor([]string{"VAULT_AGENT_ADDR=ftp://agent"})
+	if err == nil || !strings.Contains(err.Error(), "VAULT_AGENT_ADDR") {
+		t.Errorf("err = %v", err)
+	}
+}
+
+func TestUnparsableAddressRedacted(t *testing.T) {
+	a, out, _ := newTestApp(t)
+	writeContexts(t, a, map[string]string{"x": "https://user:s3cret@[::1"})
+	for _, args := range [][]string{{"check"}, {"ls"}} {
+		out.Reset()
+		a.run(args)
+		if strings.Contains(out.String(), "s3cret") {
+			t.Errorf("%v shows the password:\n%s", args, out)
 		}
 	}
 }

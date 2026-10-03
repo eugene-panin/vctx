@@ -52,10 +52,10 @@ func (a *app) ensureReachable(name string, env []string) error {
 
 // contextStatus is the probe outcome of one context.
 type contextStatus struct {
-	name    string
-	target  string
-	display string
-	unix    bool
+	name     string
+	endpoint string // host:port vctx connects to, and the proxy if any
+	display  string
+	unix     bool
 	probeResult
 }
 
@@ -96,11 +96,12 @@ func (s contextStatus) latencyText() string {
 	return fmt.Sprintf("%dms", max(s.latency.Milliseconds(), 1))
 }
 
-// prepared is a context ready to probe and to run commands in.
+// prepared is a context resolved once: what to probe, and the variables to
+// run commands with (after registerHelper adds the token helper).
 type prepared struct {
 	status contextStatus
 	vars   map[string]string // contextVars: as configured, plus vctx bookkeeping
-	env    []string
+	env    []string          // environment for probing
 	target target
 	// The address could not be resolved: status.err says why, and there is nothing to probe.
 	badAddr bool
@@ -115,17 +116,17 @@ func (a *app) prepare(cfg *config, name string) (prepared, error) {
 	}
 	p := prepared{status: contextStatus{name: name}, vars: vars, env: applyEnv(a.environ, vars)}
 	if p.target, err = targetFor(p.env); err != nil {
-		p.status.display = sanitize(vaultAddr(vars), 60)
-		p.status.target = p.status.display
+		p.status.display = sanitize(redactAddr(vaultAddr(vars)), 60)
+		p.status.endpoint = p.status.display
 		p.status.err = err
 		p.badAddr = true
 		return p, nil
 	}
-	p.status.target, p.status.display, p.status.unix = p.target.String(), p.target.display(), p.target.unix != ""
+	p.status.endpoint, p.status.display, p.status.unix = p.target.String(), p.target.display(), p.target.unix != ""
 	return p, nil
 }
 
-func (p *prepared) probe(timeout time.Duration) probeResult {
+func (p *prepared) probeHealth(timeout time.Duration) probeResult {
 	return probe(context.Background(), p.target, p.env, timeout)
 }
 
@@ -134,7 +135,7 @@ func probeAll(ps []prepared, timeout time.Duration) {
 	var wg sync.WaitGroup
 	for i := range ps {
 		if !ps[i].badAddr {
-			wg.Go(func() { ps[i].status.probeResult = ps[i].probe(timeout) })
+			wg.Go(func() { ps[i].status.probeResult = ps[i].probeHealth(timeout) })
 		}
 	}
 	wg.Wait()
@@ -171,7 +172,7 @@ func (a *app) check(args []string) error {
 
 	if a.stdoutTTY {
 		current, _ := a.contextName("")
-		fmt.Fprintln(a.stdout, a.renderStatusTable(statuses, current))
+		fmt.Fprintln(a.stdout, a.renderStatusTable(cfg, statuses, current))
 	} else {
 		tw := tabwriter.NewWriter(a.stdout, 0, 4, 2, ' ', 0)
 		for _, s := range statuses {
@@ -179,7 +180,7 @@ func (a *app) check(args []string) error {
 			if lvl == levelOK {
 				text += " " + s.latencyText()
 			}
-			fmt.Fprintf(tw, "%s\t%s\t%s\n", s.name, s.target, text)
+			fmt.Fprintf(tw, "%s\t%s\t%s\n", s.name, s.endpoint, text)
 		}
 		if err := tw.Flush(); err != nil {
 			return err

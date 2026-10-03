@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -15,6 +16,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 	"unicode"
 
@@ -39,32 +41,32 @@ type target struct {
 func targetFor(env []string) (target, error) {
 	get := func(keys ...string) string {
 		for _, k := range keys {
-			if v := lookupEnv(env, k); v != "" {
+			if v := envValue(env, k); v != "" {
 				return v
 			}
 		}
 		return ""
 	}
 
-	raw := get("VAULT_AGENT_ADDR", "VAULT_ADDR")
+	raw, from := addrFrom(func(k string) string { return envValue(env, k) })
 	if raw == "" {
-		raw = defaultVaultAddr
+		raw, from = defaultVaultAddr, "VAULT_ADDR"
 	}
 	u, err := url.Parse(raw)
 	if err != nil {
-		return target{}, &configError{fmt.Errorf("parse VAULT_ADDR: %w", parseReason(err))}
+		return target{}, &configError{fmt.Errorf("parse %s: %w", from, parseReason(err))}
 	}
 	switch u.Scheme {
 	case "unix":
 		// Like Vault, take everything after the scheme: url.Parse puts a relative path in Host.
 		path := strings.TrimPrefix(raw, "unix://")
 		if path == "" || path == raw {
-			return target{}, &configError{errors.New("VAULT_ADDR: unix:// needs a socket path")}
+			return target{}, &configError{fmt.Errorf("%s: unix:// needs a socket path", from)}
 		}
 		return target{addr: &url.URL{Scheme: "http", Host: "localhost"}, unix: path}, nil
 	case "http", "https":
 	default:
-		return target{}, &configError{fmt.Errorf("VAULT_ADDR %q: want http://, https:// or unix://", raw)}
+		return target{}, &configError{fmt.Errorf("%s %q: want http://, https:// or unix://", from, redactAddr(raw))}
 	}
 
 	t := target{addr: u}
@@ -98,7 +100,7 @@ func parseReason(err error) error {
 	return err
 }
 
-// display is the address as written in VAULT_ADDR, for humans.
+// display is the host vault talks to, and the proxy if any, for humans.
 func (t target) display() string {
 	switch {
 	case t.unix != "":
@@ -138,14 +140,14 @@ func hostPort(u *url.URL) string {
 func tlsConfig(env []string) (*tls.Config, error) {
 	cfg := &tls.Config{
 		MinVersion: tls.VersionTLS12,
-		ServerName: lookupEnv(env, "VAULT_TLS_SERVER_NAME"),
+		ServerName: envValue(env, "VAULT_TLS_SERVER_NAME"),
 	}
-	if skip, _ := strconv.ParseBool(lookupEnv(env, "VAULT_SKIP_VERIFY")); skip {
+	if skip, _ := strconv.ParseBool(envValue(env, "VAULT_SKIP_VERIFY")); skip {
 		cfg.InsecureSkipVerify = true // #nosec G402 -- explicitly requested by the context
 	}
 
 	var pems [][]byte
-	switch file, inline, dir := lookupEnv(env, "VAULT_CACERT"), lookupEnv(env, "VAULT_CACERT_BYTES"), lookupEnv(env, "VAULT_CAPATH"); {
+	switch file, inline, dir := envValue(env, "VAULT_CACERT"), envValue(env, "VAULT_CACERT_BYTES"), envValue(env, "VAULT_CAPATH"); {
 	case file != "":
 		pem, err := os.ReadFile(file)
 		if err != nil {
@@ -179,7 +181,7 @@ func tlsConfig(env []string) (*tls.Config, error) {
 		}
 	}
 
-	if cert, key := lookupEnv(env, "VAULT_CLIENT_CERT"), lookupEnv(env, "VAULT_CLIENT_KEY"); cert != "" && key != "" {
+	if cert, key := envValue(env, "VAULT_CLIENT_CERT"), envValue(env, "VAULT_CLIENT_KEY"); cert != "" && key != "" {
 		pair, err := tls.LoadX509KeyPair(cert, key)
 		if err != nil {
 			return nil, fmt.Errorf("load client certificate: %w", err)
@@ -330,10 +332,18 @@ func probe(ctx context.Context, t target, env []string, timeout time.Duration) p
 	defer resp.Body.Close()
 	latency := time.Since(start)
 
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if err != nil {
+		return probeResult{err: err}
+	}
 	// sys/health signals node state through many status codes (429 standby,
 	// 503 sealed, 474 HA unhealthy, 530 removed, ...); the body tells Vault apart.
-	if h, ok := decodeHealth(resp.Body); ok {
+	if h, ok := decodeHealth(bytes.NewReader(body)); ok {
 		return probeResult{health: &h, latency: latency}
+	}
+	// Go's TLS servers, Vault included, answer plain HTTP with this 400.
+	if resp.StatusCode == http.StatusBadRequest && bytes.Contains(body, []byte("HTTP request to an HTTPS server")) {
+		return probeResult{err: &configError{errors.New("the server speaks TLS: use https:// in the address")}}
 	}
 	notVault := &notVaultError{status: resp.StatusCode, contentType: sanitize(resp.Header.Get("Content-Type"), 40)}
 	if notVault.contentType == "" {
@@ -346,16 +356,30 @@ func probe(ctx context.Context, t target, env []string, timeout time.Duration) p
 }
 
 // proxyRefusal recognizes a failed CONNECT: net/http reports it only as the
-// proxy's status text ("Forbidden"), with no type of its own.
+// proxy's status text ("Forbidden"), with no type of its own. Anything else
+// with a classification of its own is left alone.
 func proxyRefusal(t target, err error) error {
 	var urlErr *url.Error
-	var opErr *net.OpError
-	var netErr net.Error
-	if t.proxy == nil || !errors.As(err, &urlErr) || errors.As(err, &opErr) ||
-		(errors.As(err, &netErr) && netErr.Timeout()) || isTLSError(err) {
+	if t.proxy == nil || !errors.As(err, &urlErr) {
+		return err
+	}
+	if short, _ := classify(err); short != "error" {
 		return err
 	}
 	return &proxyError{proxy: t.proxy.Host, err: urlErr.Err}
+}
+
+// notTLS matches a TLS client talking to a plain HTTP server; net/http reports
+// it as a tls.RecordHeaderError or, after reading a response, only as text.
+func notTLS(err error) bool {
+	var recErr tls.RecordHeaderError
+	return errors.As(err, &recErr) || strings.Contains(err.Error(), "server gave HTTP response to HTTPS client")
+}
+
+// connClosed matches a server that accepted the connection and dropped it,
+// such as a Vault cluster port spoken to over HTTP.
+func connClosed(err error) bool {
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, syscall.ECONNRESET)
 }
 
 // isTLSError reports a failed TLS handshake: a certificate the client rejects,
@@ -382,7 +406,6 @@ func classify(err error) (short, long string) {
 	var pxErr *proxyError
 	var nv *notVaultError
 	var dnsErr *net.DNSError
-	var recErr tls.RecordHeaderError
 	var netErr net.Error
 	switch {
 	case errors.As(err, &cfgErr):
@@ -402,8 +425,10 @@ func classify(err error) (short, long string) {
 		}
 		return "tls error", "tls: " + sanitize(err.Error(), 300)
 	// net/http reports this case only as text.
-	case errors.As(err, &recErr), strings.Contains(err.Error(), "server gave HTTP response to HTTPS client"):
+	case notTLS(err):
 		return "not tls", "tls: server does not speak TLS (http:// instead of https://?)"
+	case connClosed(err):
+		return "unreachable", "unreachable: connection closed by the server"
 	case errors.As(err, &dnsErr):
 		return "no dns", "unreachable: cannot resolve " + sanitize(dnsErr.Name, 100)
 	case errors.Is(err, context.DeadlineExceeded), errors.As(err, &netErr) && netErr.Timeout():
@@ -428,7 +453,10 @@ func networkProblem(err error) bool {
 	var opErr *net.OpError
 	var dnsErr *net.DNSError
 	var netErr net.Error
-	return errors.As(err, &nv) || errors.As(err, &pxErr) || errors.As(err, &opErr) || errors.As(err, &dnsErr) ||
+	if notTLS(err) {
+		return false
+	}
+	return connClosed(err) || errors.As(err, &nv) || errors.As(err, &pxErr) || errors.As(err, &opErr) || errors.As(err, &dnsErr) ||
 		errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &netErr) && netErr.Timeout())
 }
 

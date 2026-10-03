@@ -7,6 +7,7 @@ import (
 	"io"
 	"io/fs"
 	"maps"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -78,12 +79,40 @@ func loadConfig(path string) (*config, error) {
 	return &c, nil
 }
 
-// vaultAddr is the address vault talks to for vars: VAULT_AGENT_ADDR wins over VAULT_ADDR, as in the Vault CLI.
-func vaultAddr(vars map[string]string) string {
-	if addr := vars["VAULT_AGENT_ADDR"]; addr != "" {
-		return addr
+// addrFrom picks the address vault talks to and the variable it came from:
+// VAULT_AGENT_ADDR wins over VAULT_ADDR, as in the Vault CLI.
+func addrFrom(get func(string) string) (addr, from string) {
+	for _, k := range []string{"VAULT_AGENT_ADDR", "VAULT_ADDR"} {
+		if v := get(k); v != "" {
+			return v, k
+		}
 	}
-	return vars["VAULT_ADDR"]
+	return "", ""
+}
+
+func vaultAddr(vars map[string]string) string {
+	addr, _ := addrFrom(func(k string) string { return vars[k] })
+	return addr
+}
+
+// normalizeAddr is how addresses are compared and stored with tokens.
+func normalizeAddr(addr string) string {
+	if addr == "" {
+		addr = defaultVaultAddr
+	}
+	return strings.TrimRight(addr, "/")
+}
+
+// redactAddr hides credentials in an address for display, even one url.Parse rejects.
+func redactAddr(s string) string {
+	if u, err := url.Parse(s); err == nil {
+		return u.Redacted()
+	}
+	scheme := strings.Index(s, "://")
+	if at := strings.LastIndex(s, "@"); scheme >= 0 && at > scheme {
+		return s[:scheme+3] + "xxxxx" + s[at:]
+	}
+	return s
 }
 
 // checkPrivate refuses a file or directory another user could modify, as ssh does:

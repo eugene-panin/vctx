@@ -2,12 +2,14 @@ package main
 
 import (
 	"errors"
+	"maps"
 	"os"
 	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -60,7 +62,11 @@ func newTestModel(t *testing.T) (*model, *app) {
 
 func TestViewFitsWindow(t *testing.T) {
 	m, _ := newTestModel(t)
-	for _, size := range [][2]int{{40, 12}, {70, 20}, {90, 8}, {109, 30}, {110, 30}, {180, 50}, {200, 6}} {
+	sizes := [][2]int{{90, 8}, {109, 30}, {110, 30}, {180, 50}, {200, 6}}
+	for w := 30; w <= 120; w++ { // bubbles/help overran some of these widths
+		sizes = append(sizes, [2]int{w, 20})
+	}
+	for _, size := range sizes {
 		m.Update(tea.WindowSizeMsg{Width: size[0], Height: size[1]})
 		view := m.View()
 		lines := strings.Split(view, "\n")
@@ -88,10 +94,11 @@ func TestViewWhileProbing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	m.Init() // marks every row as probing; the probes themselves are not run
 	for _, w := range []int{60, 150} {
 		m.Update(tea.WindowSizeMsg{Width: w, Height: 24})
-		if view := m.View(); !strings.Contains(view, "checking") {
-			t.Errorf("width %d: no checking state:\n%s", w, view)
+		if view := m.View(); !strings.Contains(view, m.spin.View()+" checking") {
+			t.Errorf("width %d: no spinner while probing:\n%s", w, view)
 		}
 	}
 }
@@ -124,7 +131,7 @@ func TestForgetToken(t *testing.T) {
 	}
 	_, cmd = m.Update(cmd())
 	m.Update(cmd())
-	if m.tokens["dev"] {
+	if m.tokens["dev"] != tokenNone {
 		t.Error("token still shown")
 	}
 	if _, err := os.Stat(a.tokenPath("dev")); !errors.Is(err, os.ErrNotExist) {
@@ -192,7 +199,7 @@ func TestStaleTokenStatusIgnored(t *testing.T) {
 	_, cmd = m.Update(cmd())
 	m.Update(slow)
 	m.Update(cmd())
-	if m.tokens["dev"] {
+	if m.tokens["dev"] != tokenNone {
 		t.Error("late token status brought a forgotten token back")
 	}
 }
@@ -220,5 +227,101 @@ func TestRefreshRetriesConfigErrorsFromProbe(t *testing.T) {
 	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
 	if m.rows[0].gen == gen {
 		t.Error("refresh skipped a context whose address is fine")
+	}
+}
+
+// drain runs cmd the way bubbletea does and feeds the result back, so a panic
+// in a command shows up in the test. Spinner ticks are not fed back: they would
+// keep the loop going while anything is probing.
+func drain(t *testing.T, m *model, cmd tea.Cmd, depth int) {
+	t.Helper()
+	if cmd == nil || depth > 20 {
+		return
+	}
+	switch msg := cmd().(type) {
+	case nil, tea.QuitMsg, spinner.TickMsg:
+	case tea.BatchMsg:
+		for _, c := range msg {
+			drain(t, m, c, depth+1)
+		}
+	default:
+		_, next := m.Update(msg)
+		drain(t, m, next, depth+1)
+	}
+}
+
+func TestEveryKeyOnEveryKindOfContext(t *testing.T) {
+	a, _, _ := newTestApp(t)
+	ok := serve(t, vaultHandler(200, activeBody))
+	cfg := "contexts:\n" +
+		"  ok:\n    VAULT_ADDR: " + ok + "\n" +
+		"  badaddr:\n    VAULT_ADDR: vault.example.com:8200\n" +
+		"  down:\n    VAULT_ADDR: " + closedURL(t) + "\n" +
+		"  noca:\n    VAULT_ADDR: " + ok + "\n    VAULT_CACERT: /nonexistent/ca.pem\n"
+	if err := os.WriteFile(a.configPath, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c := loadTestConfig(t, a)
+	press := func(s string) tea.KeyMsg {
+		switch s {
+		case "down":
+			return tea.KeyMsg{Type: tea.KeyDown}
+		case "up":
+			return tea.KeyMsg{Type: tea.KeyUp}
+		case "enter":
+			return tea.KeyMsg{Type: tea.KeyEnter}
+		}
+		return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s)}
+	}
+
+	for row := range 4 {
+		for _, name := range slices.Sorted(maps.Keys(c.Contexts)) {
+			if err := writeFileAtomic(a.tokenPath(name), []byte("http://x\nt\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		m, err := newModel(a, c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m.spin.Spinner.FPS = time.Microsecond
+		m.Update(tea.WindowSizeMsg{Width: 120, Height: 24})
+		drain(t, m, m.Init(), 0)
+		m.cursor = row
+		name := m.rows[row].status.name
+		for _, k := range []string{"r", "l", "s", "x", "down", "up", "enter"} {
+			_, cmd := m.Update(press(k))
+			drain(t, m, cmd, 0)
+			if k == "l" || k == "s" {
+				// The command itself does not run in a test; its completion does.
+				_, cmd = m.Update(execDoneMsg{i: m.cursor, what: name + " " + k})
+				drain(t, m, cmd, 0)
+			}
+			for _, line := range strings.Split(m.View(), "\n") {
+				if lipgloss.Width(line) > 120 {
+					t.Errorf("%s after %q: line too wide: %q", name, k, line)
+				}
+			}
+		}
+		if want := m.rows[m.cursor].status.name; m.chosen != want {
+			t.Errorf("%s: enter chose %q, cursor on %q", name, m.chosen, want)
+		}
+	}
+}
+
+func TestMultilineValueInDetails(t *testing.T) {
+	a, _, _ := newTestApp(t)
+	cfg := "contexts:\n  x:\n    VAULT_ADDR: http://v\n    VAULT_CACERT_BYTES: |\n      -----BEGIN CERTIFICATE-----\n      MIIB\n      -----END CERTIFICATE-----\n"
+	if err := os.WriteFile(a.configPath, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m, err := newModel(a, loadTestConfig(t, a))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Update(tea.WindowSizeMsg{Width: 150, Height: 30})
+	view := m.View()
+	if !strings.Contains(view, "VAULT_CACERT_BYTES=-----BEGIN CERTIFICATE-----…") || strings.Contains(view, "MIIB") {
+		t.Errorf("details:\n%s", view)
 	}
 }

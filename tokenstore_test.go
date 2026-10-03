@@ -37,37 +37,69 @@ func (f fakeKeyring) Delete(service, user string) error {
 	return nil
 }
 
-func TestKeychainStore(t *testing.T) {
-	a, out, _ := newTestApp(t, "VCTX_TOKEN_STORE=keychain")
-	kr := fakeKeyring{}
-	a.keyring = kr
-
-	// A token file from an earlier version moves into the keychain on first read.
-	if err := writeFileAtomic(a.tokenPath("dev"), []byte("https://127.0.0.1:8200\nold-token\n"), 0o600); err != nil {
+func loadTestConfig(t *testing.T, a *app) *config {
+	t.Helper()
+	cfg, err := a.loadConfig()
+	if err != nil {
 		t.Fatal(err)
 	}
-	a.environ = withEnv(a.environ, "VCTX_CONTEXT=dev")
+	return cfg
+}
+
+func TestKeychainStore(t *testing.T) {
+	const addr = "VAULT_ADDR=http://127.0.0.1:8201" // dev's address in testConfig
+	a, out, _ := newTestApp(t, "VCTX_TOKEN_STORE=keychain", "VCTX_CONTEXT=dev", addr)
+	kr := fakeKeyring{}
+	a.keyring = kr
+	cfg := loadTestConfig(t, a)
+
+	// A token file from an earlier version is read as is, without writing anything.
+	if err := writeFileAtomic(a.tokenPath("dev"), []byte("http://127.0.0.1:8201\nold-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if err := a.run([]string{"get"}); err != nil {
 		t.Fatal(err)
 	}
-	if out.String() != "old-token" {
-		t.Errorf("migrated token = %q", out.String())
+	if out.String() != "old-token" || len(kr) != 0 {
+		t.Errorf("legacy read: token %q, keychain %v", out, kr)
+	}
+	if got, err := a.tokenStatus(cfg, []string{"dev", "prod"}); err != nil || got["dev"] != tokenOK || got["prod"] != tokenNone {
+		t.Errorf("token status = %v, %v", got, err)
+	}
+
+	// The next login moves it into the keychain.
+	a.stdin = strings.NewReader("new-token")
+	if err := a.run([]string{"store"}); err != nil {
+		t.Fatal(err)
 	}
 	if _, err := os.Stat(a.tokenPath("dev")); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("token file left behind: %v", err)
 	}
-	if kr["vctx/dev"] != "https://127.0.0.1:8200\nold-token\n" {
+	if kr["vctx/dev"] != "http://127.0.0.1:8201\nnew-token\n" {
 		t.Errorf("keychain = %v", kr)
 	}
 
-	if got, err := a.tokenStatus([]string{"dev", "prod"}); err != nil || !got["dev"] || got["prod"] {
-		t.Errorf("token status = %v, %v", got, err)
-	}
 	if err := a.run([]string{"logout", "dev"}); err != nil {
 		t.Fatal(err)
 	}
 	if len(kr) != 0 {
 		t.Errorf("keychain after logout = %v", kr)
+	}
+}
+
+func TestTokenStatusSeesAddressChange(t *testing.T) {
+	a, _, _ := newTestApp(t, "VCTX_CONTEXT=dev", "VAULT_ADDR=http://127.0.0.1:8201")
+	a.stdin = strings.NewReader("tok")
+	if err := a.run([]string{"store"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := loadTestConfig(t, a)
+	if got, _ := a.tokenStatus(cfg, []string{"dev"}); got["dev"] != tokenOK {
+		t.Errorf("before: %v", got)
+	}
+	cfg.Contexts["dev"]["VAULT_ADDR"] = "http://localhost:8201"
+	if got, _ := a.tokenStatus(cfg, []string{"dev"}); got["dev"] != tokenStale {
+		t.Errorf("after the address changed: %v", got)
 	}
 }
 
@@ -86,7 +118,7 @@ func (brokenKeyring) Has(string, string) (bool, error)   { return false, errors.
 func TestKeychainErrorsReported(t *testing.T) {
 	a, _, _ := newTestApp(t, "VCTX_TOKEN_STORE=keychain", "VCTX_CONTEXT=dev")
 	a.keyring = brokenKeyring{fakeKeyring{}}
-	if _, err := a.tokenStatus([]string{"dev"}); err == nil || !strings.Contains(err.Error(), "locked") || !strings.Contains(err.Error(), "VCTX_TOKEN_STORE=file") {
+	if _, err := a.tokenStatus(loadTestConfig(t, a), []string{"dev"}); err == nil || !strings.Contains(err.Error(), "locked") || !strings.Contains(err.Error(), "VCTX_TOKEN_STORE=file") {
 		t.Errorf("tokenStatus err = %v", err)
 	}
 	if err := a.run([]string{"get"}); err == nil {
@@ -101,7 +133,7 @@ func TestHasDoesNotMigrate(t *testing.T) {
 	if err := writeFileAtomic(a.tokenPath("dev"), []byte("t"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := a.tokenStatus([]string{"dev"}); err != nil || !got["dev"] {
+	if got, err := a.tokenStatus(loadTestConfig(t, a), []string{"dev"}); err != nil || got["dev"] == tokenNone {
 		t.Fatalf("status = %v, %v", got, err)
 	}
 	if len(kr) != 0 {

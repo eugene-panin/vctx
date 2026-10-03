@@ -15,8 +15,8 @@ import (
 
 const (
 	envContext = "VCTX_CONTEXT"
-	// envManaged lists non-VAULT_ variables exported by the active context,
-	// so switching away from it in a shell can unset them.
+	// envManaged lists non-VAULT_ variables the active context set, so switching
+	// away from it can drop them or give back the values they replaced.
 	envManaged = "VCTX_VARS"
 )
 
@@ -24,13 +24,14 @@ const (
 // newer ones exec it directly; a path of these characters is safe either way.
 var helperPathRe = regexp.MustCompile(`^[A-Za-z0-9/._+-]+$`)
 
-// lookupEnv returns the first value of key, as getenv(3) and the Go runtime do.
-func lookupEnv(env []string, key string) string {
-	v, _ := lookupEnvOK(env, key)
+// envValue returns the first value of key in env, as getenv(3) and the Go runtime do.
+func envValue(env []string, key string) string {
+	v, _ := lookupEnv(env, key)
 	return v
 }
 
-func lookupEnvOK(env []string, key string) (string, bool) {
+// lookupEnv is os.LookupEnv over env.
+func lookupEnv(env []string, key string) (string, bool) {
 	for _, kv := range env {
 		if k, v, _ := strings.Cut(kv, "="); k == key {
 			return v, true
@@ -96,11 +97,13 @@ func planEnv(environ []string, vars map[string]string) envPlan {
 		case k == envManaged:
 			drop[k] = true
 			for _, f := range strings.Fields(v) {
-				prev[f], drop[f] = true, true
+				if overridable(f) {
+					prev[f], drop[f] = true, true
+				}
 			}
 		case strings.HasPrefix(k, envSavedPrefix):
 			drop[k] = true
-			if name := strings.TrimPrefix(k, envSavedPrefix); envKeyRe.MatchString(name) {
+			if name := strings.TrimPrefix(k, envSavedPrefix); overridable(name) {
 				if _, dup := saved[name]; !dup {
 					saved[name] = v
 				}
@@ -111,12 +114,12 @@ func planEnv(environ []string, vars map[string]string) envPlan {
 	set := make(map[string]string, len(vars))
 	maps.Copy(set, vars)
 	for k := range vars {
-		if strings.HasPrefix(k, "VAULT_") || strings.HasPrefix(k, "VCTX_") {
+		if !overridable(k) {
 			continue
 		}
 		orig, had := saved[k]
 		if !prev[k] {
-			orig, had = lookupEnvOK(environ, k)
+			orig, had = lookupEnv(environ, k)
 		}
 		if had {
 			set[envSavedPrefix+k] = orig
@@ -137,6 +140,12 @@ func planEnv(environ []string, vars map[string]string) envPlan {
 		}
 	}
 	return envPlan{set: set, unset: unset}
+}
+
+// overridable reports a variable whose user value a context may replace and
+// vctx gives back later; VAULT_* and vctx's own variables are always dropped.
+func overridable(k string) bool {
+	return envKeyRe.MatchString(k) && !strings.HasPrefix(k, "VAULT_") && !strings.HasPrefix(k, "VCTX_")
 }
 
 func applyEnv(environ []string, vars map[string]string) []string {
@@ -173,12 +182,13 @@ func shellQuote(s string) string {
 }
 
 // lookPath is exec.LookPath against the PATH the command will run with, which
-// the context may set. Relative PATH entries are skipped, as exec.LookPath does.
+// the context may set. Relative PATH entries are skipped where exec.LookPath
+// would return exec.ErrDot.
 func lookPath(file string, env []string) (string, error) {
 	if strings.Contains(file, "/") {
 		return exec.LookPath(file)
 	}
-	for _, dir := range filepath.SplitList(lookupEnv(env, "PATH")) {
+	for _, dir := range filepath.SplitList(envValue(env, "PATH")) {
 		if !filepath.IsAbs(dir) {
 			continue
 		}

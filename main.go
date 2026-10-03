@@ -23,7 +23,7 @@ Usage:
   vctx <context> [vault args...]     run vault against <context>
   vctx exec [<context>] -- cmd ...   run any command with <context> variables
   vctx env [<context>]               print shell exports: eval "$(vctx env prod)"
-  vctx env --clear                   print unsets for everything vctx manages
+  vctx env --clear                   print commands that undo 'vctx env' in a shell
   vctx use [<context>]               set the default context (UI without a name)
   vctx current                       print the active context
   vctx ls                            list contexts
@@ -66,6 +66,14 @@ programs running as you. vctx sets VAULT_CONFIG_PATH to a generated config
 that registers vctx itself as the Vault token helper.
 
 The config and the state directory must not be writable by other users.
+
+Environment:
+  VCTX_CONFIG         config file
+  VCTX_STATE_DIR      tokens, default context, generated Vault config
+  VCTX_TOKEN_STORE    file or keychain
+  VCTX_CHECK_TIMEOUT  reachability check timeout, 0 disables it
+  VCTX_VAULT_BIN      vault binary to run (default: vault on PATH)
+  VCTX_CONTEXT        set by 'vctx env': this shell's context
 `
 
 type app struct {
@@ -89,7 +97,7 @@ var errSilent = errors.New("failed")
 // usageError is a malformed command line; it exits with status 2.
 type usageError string
 
-func (e usageError) Error() string { return "usage: " + string(e) }
+func (e usageError) Error() string { return string(e) }
 
 func main() {
 	a, err := newApp()
@@ -158,7 +166,7 @@ func (a *app) xdgDir(env, fallback string) string {
 }
 
 func (a *app) getenv(key string) string {
-	return lookupEnv(a.environ, key)
+	return envValue(a.environ, key)
 }
 
 func (a *app) run(args []string) error {
@@ -180,10 +188,13 @@ func (a *app) run(args []string) error {
 	case "ui":
 		return a.ui()
 	case "ls", "list":
+		if len(rest) > 0 {
+			return usageError("usage: vctx ls")
+		}
 		return a.list()
 	case "use":
 		if len(rest) > 1 {
-			return usageError("vctx use [<context>]")
+			return usageError("usage: vctx use [<context>]")
 		}
 		if len(rest) == 0 {
 			return a.ui()
@@ -198,6 +209,9 @@ func (a *app) run(args []string) error {
 		a.printUsing(rest[0], cfg)
 		return nil
 	case "current":
+		if len(rest) > 0 {
+			return usageError("usage: vctx current")
+		}
 		name, err := a.contextName("")
 		if err != nil {
 			return err
@@ -207,10 +221,13 @@ func (a *app) run(args []string) error {
 	case "env":
 		return a.env(rest)
 	case "check":
+		if slices.ContainsFunc(rest, func(arg string) bool { return strings.HasPrefix(arg, "-") }) {
+			return usageError("usage: vctx check [<context>...]")
+		}
 		return a.check(rest)
 	case "logout":
 		if len(rest) > 1 {
-			return usageError("vctx logout [<context>]")
+			return usageError("usage: vctx logout [<context>]")
 		}
 		var arg string
 		if len(rest) == 1 {
@@ -231,11 +248,11 @@ func (a *app) run(args []string) error {
 		if err != nil {
 			return err
 		}
-		return store.del(name)
+		return a.forgetToken(store, name)
 	case "exec":
 		name, argv := splitExec(rest)
 		if len(argv) == 0 {
-			return usageError("vctx exec [<context>] -- command [args...]")
+			return usageError("usage: vctx exec [<context>] -- command [args...]")
 		}
 		return a.execIn(name, argv)
 	default:
@@ -326,7 +343,7 @@ func (a *app) list() error {
 	}
 	current, _ := a.contextName("")
 	names := slices.Sorted(maps.Keys(cfg.Contexts))
-	tokens, err := a.tokenStatus(names)
+	tokens, err := a.tokenStatus(cfg, names)
 	if err != nil {
 		fmt.Fprintln(a.stderr, "vctx: token status:", err)
 	}
@@ -341,14 +358,17 @@ func (a *app) list() error {
 			mark = "*"
 		}
 		token := "-"
-		if tokens[name] {
+		switch tokens[name] {
+		case tokenOK:
 			token = "token"
+		case tokenStale:
+			token = "stale"
 		}
 		ns := vars["VAULT_NAMESPACE"]
 		if ns == "" {
 			ns = "-"
 		}
-		fmt.Fprintf(tw, "%s %s\t%s\t%s\t%s\n", mark, name, vaultAddr(vars), ns, token)
+		fmt.Fprintf(tw, "%s %s\t%s\t%s\t%s\n", mark, name, redactAddr(vaultAddr(vars)), ns, token)
 	}
 	return tw.Flush()
 }
@@ -377,7 +397,7 @@ func (a *app) env(args []string) error {
 		return nil
 	}
 	if len(args) > 1 || len(args) == 1 && strings.HasPrefix(args[0], "-") {
-		return usageError("vctx env [<context> | --clear]")
+		return usageError("usage: vctx env [<context> | --clear]")
 	}
 	var arg string
 	if len(args) == 1 {
@@ -415,7 +435,7 @@ func (a *app) execIn(arg string, argv []string) error {
 }
 
 func (a *app) execWith(cfg *config, name string, argv []string) error {
-	if filepath.Base(argv[0]) == filepath.Base(a.vaultBin()) {
+	if bin := filepath.Base(argv[0]); bin == "vault" || bin == filepath.Base(a.vaultBin()) {
 		if flag := addressFlag(argv[1:]); flag != "" {
 			return fmt.Errorf("%s would send the %s token to another server; set the address in the context instead", flag, name)
 		}

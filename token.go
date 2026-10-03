@@ -3,8 +3,11 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
+	"os"
 	"path/filepath"
 	"strings"
 )
@@ -20,6 +23,29 @@ func (a *app) tokenPath(name string) string {
 	return filepath.Join(a.stateDir, "tokens", name)
 }
 
+// addrPath records, next to the secret store, the address a token was issued
+// for, so status can be shown without reading the secret.
+func (a *app) addrPath(key string) string {
+	return filepath.Join(a.stateDir, "addrs", filepath.FromSlash(key))
+}
+
+func (a *app) storeToken(store tokenStore, key, addr, token string) error {
+	if err := store.set(key, addr+"\n"+token+"\n"); err != nil {
+		return err
+	}
+	return writeFileAtomic(a.addrPath(key), []byte(addr+"\n"), 0o600)
+}
+
+func (a *app) forgetToken(store tokenStore, key string) error {
+	if err := store.del(key); err != nil {
+		return err
+	}
+	if err := os.Remove(a.addrPath(key)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
 // tokenKey picks the token for the calling vault process: by context when
 // vault was started through vctx, otherwise by address and namespace. The "_"
 // prefix cannot start a context name, so the two kinds of keys never collide.
@@ -33,14 +59,8 @@ func (a *app) tokenKey() string {
 
 // callerAddr is the address the calling vault process talks to.
 func (a *app) callerAddr() string {
-	addr := a.getenv("VAULT_AGENT_ADDR")
-	if addr == "" {
-		addr = a.getenv("VAULT_ADDR")
-	}
-	if addr == "" {
-		addr = defaultVaultAddr
-	}
-	return strings.TrimRight(addr, "/")
+	addr, _ := addrFrom(a.getenv)
+	return normalizeAddr(addr)
 }
 
 // tokenHelper implements the Vault token helper protocol:
@@ -76,11 +96,11 @@ func (a *app) tokenHelper(op string) error {
 		}
 		token := strings.TrimSpace(string(b))
 		if token == "" {
-			return store.del(key)
+			return a.forgetToken(store, key)
 		}
-		return store.set(key, a.callerAddr()+"\n"+token+"\n")
+		return a.storeToken(store, key, a.callerAddr(), token)
 	case "erase":
-		return store.del(key)
+		return a.forgetToken(store, key)
 	}
 	return fmt.Errorf("unknown token helper operation %q", op)
 }

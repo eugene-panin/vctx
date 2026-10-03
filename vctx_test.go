@@ -531,7 +531,7 @@ func TestConfigSizeLimit(t *testing.T) {
 }
 
 func TestLookupEnvFirstWins(t *testing.T) {
-	if got := lookupEnv([]string{"A=1", "A=2"}, "A"); got != "1" {
+	if got := envValue([]string{"A=1", "A=2"}, "A"); got != "1" {
 		t.Errorf("got %q", got)
 	}
 }
@@ -554,15 +554,15 @@ func TestSwitchRestoresOwnValues(t *testing.T) {
 	}
 
 	inA := ctx(user, "a")
-	if lookupEnv(inA, "PATH") != "/opt/a/bin:/usr/bin" || lookupEnv(inA, "VCTX_SAVED_PATH") != "/usr/bin" {
+	if envValue(inA, "PATH") != "/opt/a/bin:/usr/bin" || envValue(inA, "VCTX_SAVED_PATH") != "/usr/bin" {
 		t.Errorf("in a: %q", inA)
 	}
 	// Re-applying a must not save a's own value as the user's.
-	if again := ctx(inA, "a"); lookupEnv(again, "VCTX_SAVED_PATH") != "/usr/bin" {
+	if again := ctx(inA, "a"); envValue(again, "VCTX_SAVED_PATH") != "/usr/bin" {
 		t.Errorf("a again: %q", again)
 	}
 	inB := ctx(inA, "b")
-	if lookupEnv(inB, "PATH") != "/usr/bin" || lookupEnv(inB, "HTTPS_PROXY") != "http://mine" {
+	if envValue(inB, "PATH") != "/usr/bin" || envValue(inB, "HTTPS_PROXY") != "http://mine" {
 		t.Errorf("in b: %q", inB)
 	}
 	for _, kv := range inB {
@@ -575,5 +575,36 @@ func TestSwitchRestoresOwnValues(t *testing.T) {
 	writeShellEnv(&sh, inA, nil)
 	if !strings.Contains(sh.String(), "export PATH='/usr/bin'\n") || strings.Contains(sh.String(), "unset PATH") {
 		t.Errorf("--clear from a:\n%s", sh.String())
+	}
+}
+
+func TestAddressFlagWithCustomVaultBin(t *testing.T) {
+	a, _, call := newTestApp(t, "VCTX_VAULT_BIN=/opt/bin/vault-1.15")
+	if err := a.run([]string{"exec", "dev", "--", "vault", "-address=http://evil"}); err == nil || call.argv0 != "" {
+		t.Errorf("err %v, ran %v", err, call.argv0 != "")
+	}
+}
+
+func TestClearIgnoresForgedSavedVault(t *testing.T) {
+	a, out, _ := newTestApp(t, "VCTX_VARS=VAULT_ADDR", "VCTX_SAVED_VAULT_ADDR=http://evil", "VAULT_ADDR=http://real")
+	if err := a.run([]string{"env", "--clear"}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out.String(), "export VAULT_ADDR") || !strings.Contains(out.String(), "unset VAULT_ADDR") {
+		t.Errorf("output:\n%s", out)
+	}
+}
+
+func TestUsageMessages(t *testing.T) {
+	a, _, _ := newTestApp(t)
+	var uerr usageError
+	for _, args := range [][]string{{"check", "-h"}, {"ls", "x"}, {"current", "x"}} {
+		if err := a.run(args); !errors.As(err, &uerr) {
+			t.Errorf("%q: err = %v, want a usage error", args, err)
+		}
+	}
+	err := a.run([]string{"nosuch"})
+	if !errors.As(err, &uerr) || strings.HasPrefix(err.Error(), "usage:") {
+		t.Errorf("unknown command: %v", err)
 	}
 }

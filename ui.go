@@ -49,7 +49,7 @@ func newPalette(w io.Writer) palette {
 }
 
 // column styles a cell of the status table built by statusColumns.
-func (p palette) column(c int, lvl level, selected, probing bool) lipgloss.Style {
+func (p palette) column(c int, lvl level, tok tokenState, selected, probing bool) lipgloss.Style {
 	switch c {
 	case 0:
 		return p.accent
@@ -65,6 +65,10 @@ func (p palette) column(c int, lvl level, selected, probing bool) lipgloss.Style
 			return p.dim
 		}
 		return p.level(lvl)
+	case 5:
+		if tok == tokenStale {
+			return p.warn
+		}
 	}
 	return p.ok
 }
@@ -109,7 +113,7 @@ func (a *app) withSpinner(title string, fn func()) {
 }
 
 // statusColumns lays out contexts as table columns; the first is the current-context marker.
-func statusColumns(statuses []contextStatus, current string, tokens map[string]bool) ([]column, []level) {
+func statusColumns(statuses []contextStatus, current string, tokens map[string]tokenState) ([]column, []level) {
 	cols := []column{
 		{header: ""},
 		{header: "CONTEXT", min: 8, shrink: 4},
@@ -127,8 +131,11 @@ func statusColumns(statuses []contextStatus, current string, tokens map[string]b
 		if s.name == current {
 			mark = "●"
 		}
-		if tokens[s.name] {
+		switch tokens[s.name] {
+		case tokenOK:
 			token = "✓"
+		case tokenStale:
+			token = "stale"
 		}
 		for c, v := range []string{mark, s.name, s.display, text, s.latencyText(), token} {
 			cols[c].cells = append(cols[c].cells, v)
@@ -137,13 +144,13 @@ func statusColumns(statuses []contextStatus, current string, tokens map[string]b
 	return cols, levels
 }
 
-func (a *app) renderStatusTable(statuses []contextStatus, current string) string {
+func (a *app) renderStatusTable(cfg *config, statuses []contextStatus, current string) string {
 	p := newPalette(a.stdout)
 	names := make([]string, len(statuses))
 	for i, s := range statuses {
 		names[i] = s.name
 	}
-	tokens, tokenErr := a.tokenStatus(names)
+	tokens, tokenErr := a.tokenStatus(cfg, names)
 	cols, levels := statusColumns(statuses, current, tokens)
 	width := terminalWidth(a.stdout)
 	if width <= 0 {
@@ -168,7 +175,7 @@ func (a *app) renderStatusTable(statuses []contextStatus, current string) string
 	}
 	line(-1, func(int) lipgloss.Style { return p.dim })
 	for r := range statuses {
-		line(r, func(c int) lipgloss.Style { return p.column(c, levels[r], false, false) })
+		line(r, func(c int) lipgloss.Style { return p.column(c, levels[r], tokens[statuses[r].name], false, false) })
 	}
 
 	var failed, network, agent bool
