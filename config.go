@@ -43,9 +43,13 @@ func loadConfig(path string) (*config, error) {
 	if err := checkPrivate(path, fi); err != nil {
 		return nil, err
 	}
-	b, err := io.ReadAll(io.LimitReader(f, 1<<20))
+	const maxSize = 1 << 20
+	b, err := io.ReadAll(io.LimitReader(f, maxSize+1))
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
+	}
+	if len(b) > maxSize {
+		return nil, fmt.Errorf("%s: larger than %d bytes", path, maxSize)
 	}
 
 	var c config
@@ -61,14 +65,13 @@ func loadConfig(path string) (*config, error) {
 		return nil, fmt.Errorf("%s: defaults: %w", path, err)
 	}
 	for _, name := range slices.Sorted(maps.Keys(c.Contexts)) {
-		vars := c.Contexts[name]
 		if !nameRe.MatchString(name) || slices.Contains(reservedNames, name) {
 			return nil, fmt.Errorf("%s: invalid context name %q", path, name)
 		}
-		if err := checkVars(vars); err != nil {
+		if err := checkVars(c.Contexts[name]); err != nil {
 			return nil, fmt.Errorf("%s: context %s: %w", path, name, err)
 		}
-		if vaultAddr(vars) == "" {
+		if vars, _ := c.vars(name, ""); vaultAddr(vars) == "" {
 			return nil, fmt.Errorf("%s: context %s: VAULT_ADDR is required", path, name)
 		}
 	}

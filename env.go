@@ -24,8 +24,9 @@ const (
 // newer ones exec it directly; a path of these characters is safe either way.
 var helperPathRe = regexp.MustCompile(`^[A-Za-z0-9/._+-]+$`)
 
+// lookupEnv returns the first value of key, as getenv(3) and the Go runtime do.
 func lookupEnv(env []string, key string) string {
-	for _, kv := range slices.Backward(env) {
+	for _, kv := range env {
 		if k, v, _ := strings.Cut(kv, "="); k == key {
 			return v
 		}

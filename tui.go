@@ -62,6 +62,7 @@ type execDoneMsg struct {
 }
 
 type tokensMsg struct {
+	gen    int
 	tokens map[string]bool
 	err    error
 }
@@ -88,7 +89,8 @@ type model struct {
 	flashOK bool
 	chosen  string
 	// Loaded in the background: with the keychain every lookup runs a process.
-	tokens map[string]bool
+	tokens   map[string]bool
+	tokenGen int // bumped per load, and on forget, so a late answer is ignored
 }
 
 func newModel(a *app, cfg *config) (*model, error) {
@@ -119,27 +121,30 @@ func newModel(a *app, cfg *config) (*model, error) {
 		if err != nil {
 			return nil, err
 		}
-		env := applyEnv(a.environ, ctxVars)
-		t, _ := targetFor(env)
+		status, env, err := a.prepare(cfg, name)
+		if err != nil {
+			return nil, err
+		}
 		if name == m.current {
 			m.cursor = len(m.rows)
 		}
-		m.rows = append(m.rows, row{
-			name:    name,
-			vars:    vars,
-			ctxVars: ctxVars,
-			env:     env,
-			status:  contextStatus{name: name, target: t.String(), display: t.display()},
-			probing: true,
-		})
+		m.rows = append(m.rows, row{name: name, vars: vars, ctxVars: ctxVars, env: env, status: status})
 	}
 	return m, nil
 }
 
 func (m *model) Init() tea.Cmd {
+	return m.refresh()
+}
+
+// refresh reloads token status and probes every context whose address could be resolved.
+func (m *model) refresh() tea.Cmd {
 	cmds := []tea.Cmd{m.spin.Tick, m.loadTokens()}
 	for i := range m.rows {
-		cmds = append(cmds, m.probe(i))
+		var cfgErr *configError
+		if !errors.As(m.rows[i].status.err, &cfgErr) {
+			cmds = append(cmds, m.probe(i))
+		}
 	}
 	return tea.Batch(cmds...)
 }
@@ -158,10 +163,11 @@ func (m *model) loadTokens() tea.Cmd {
 	for i, r := range m.rows {
 		names[i] = r.name
 	}
-	a := m.a
+	m.tokenGen++
+	a, gen := m.a, m.tokenGen
 	return func() tea.Msg {
 		tokens, err := a.tokenStatus(names)
-		return tokensMsg{tokens: tokens, err: err}
+		return tokensMsg{gen: gen, tokens: tokens, err: err}
 	}
 }
 
@@ -208,6 +214,9 @@ func (m *model) update(msg tea.Msg) tea.Cmd {
 			r.status.probeResult = msg.res
 		}
 	case tokensMsg:
+		if msg.gen != m.tokenGen {
+			return nil
+		}
 		m.tokens = msg.tokens
 		if msg.err != nil {
 			m.setFlash("token status: "+msg.err.Error(), false)
@@ -236,9 +245,6 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 	if key.Matches(msg, keys.Quit) {
 		return tea.Quit
 	}
-	if len(m.rows) == 0 {
-		return nil
-	}
 	r := &m.rows[m.cursor]
 	switch {
 	case key.Matches(msg, keys.Up):
@@ -253,12 +259,8 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		m.chosen = r.name
 		return tea.Quit
 	case key.Matches(msg, keys.Refresh):
-		cmds := []tea.Cmd{m.spin.Tick, m.loadTokens()}
-		for i := range m.rows {
-			cmds = append(cmds, m.probe(i))
-		}
 		m.flash = ""
-		return tea.Batch(cmds...)
+		return m.refresh()
 	case key.Matches(msg, keys.Login):
 		return m.run(m.cursor, "login", m.a.vaultBin(), "login")
 	case key.Matches(msg, keys.Shell):
@@ -272,6 +274,7 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 			m.setFlash(r.name+": no stored token", false)
 			return nil
 		}
+		m.tokenGen++ // a load already under way would bring the token back
 		return m.forget(r.name)
 	}
 	return nil
@@ -309,10 +312,7 @@ type layout struct {
 func (m *model) layout() layout {
 	// One line of header, a blank line after it and one before the footer.
 	bodyH := max(m.height-1-lipgloss.Height(m.footerView())-2, 1)
-	switch {
-	case len(m.rows) == 0:
-		return layout{tableW: m.width, tableH: bodyH}
-	case m.width >= 110 && bodyH >= 5:
+	if m.width >= 110 && bodyH >= 5 {
 		detailW := min(max(m.width*2/5, 40), 64)
 		return layout{wide: true, tableW: m.width - detailW - 2, tableH: bodyH, detailW: detailW}
 	}
@@ -325,7 +325,7 @@ func (m *model) layout() layout {
 
 // scroll keeps the cursor row inside the visible part of the table.
 func (m *model) scroll() {
-	if m.width == 0 || len(m.rows) == 0 {
+	if m.width == 0 {
 		return
 	}
 	visible := max(m.layout().tableH-1, 1)
@@ -348,8 +348,6 @@ func (m *model) View() string {
 
 	var body string
 	switch {
-	case len(m.rows) == 0:
-		body = m.p.dim.Render("no contexts in " + m.a.configPath)
 	case l.wide:
 		body = lipgloss.JoinHorizontal(lipgloss.Top,
 			m.tableView(l.tableW, l.tableH), "  ", m.detailView(l.detailW, l.tableH))
@@ -551,7 +549,7 @@ func indentLines(s string, n int) string {
 // ui runs the full-screen interface; picking a context with enter makes it the default.
 func (a *app) ui() error {
 	if !a.stdinTTY || !a.stdoutTTY {
-		return errors.New("the interactive UI needs a terminal, see 'vctx help'")
+		return usageError("vctx use <context>; the interactive UI needs a terminal")
 	}
 	cfg, err := a.loadConfig()
 	if err != nil {
@@ -561,7 +559,7 @@ func (a *app) ui() error {
 	if err != nil {
 		return err
 	}
-	if _, err := tea.NewProgram(m, tea.WithAltScreen()).Run(); err != nil {
+	if _, err := tea.NewProgram(m, tea.WithAltScreen(), tea.WithInput(a.stdin), tea.WithOutput(a.stdout)).Run(); err != nil {
 		return err
 	}
 	if m.chosen != "" {

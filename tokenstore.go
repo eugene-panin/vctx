@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 
@@ -55,9 +56,10 @@ func (s fileStore) del(key string) error {
 	return nil
 }
 
-// secretService is the part of go-keyring vctx uses; tests replace it.
+// secretService is the part of the OS keychain vctx uses; tests replace it.
 type secretService interface {
 	Get(service, user string) (string, error)
+	Has(service, user string) (bool, error)
 	Set(service, user, password string) error
 	Delete(service, user string) error
 }
@@ -69,6 +71,32 @@ func (systemKeyring) Set(service, user, password string) error {
 	return keyring.Set(service, user, password)
 }
 func (systemKeyring) Delete(service, user string) error { return keyring.Delete(service, user) }
+
+// Has checks for an item without reading the secret where the platform allows:
+// go-keyring offers only Get, which on macOS runs `security ... -w` and prints it.
+func (systemKeyring) Has(service, user string) (bool, error) {
+	if runtime.GOOS != "darwin" {
+		_, err := keyring.Get(service, user)
+		if errors.Is(err, keyring.ErrNotFound) {
+			return false, nil
+		}
+		return err == nil, err
+	}
+	err := exec.Command("/usr/bin/security", "find-generic-password", "-s", service, "-a", user).Run()
+	var exitErr *exec.ExitError
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.As(err, &exitErr) && exitErr.ExitCode() == 44: // errSecItemNotFound
+		return false, nil
+	}
+	return false, err
+}
+
+// keychainError explains the usual causes: go-keyring reports only the exit status of `security`.
+func keychainError(err error) error {
+	return fmt.Errorf("keychain unavailable (locked, or an ssh session?), set VCTX_TOKEN_STORE=file to use files: %w", err)
+}
 
 // keychainStore keeps tokens in the OS keychain and moves token files
 // written by earlier versions into it on first use.
@@ -83,7 +111,7 @@ func (s keychainStore) get(key string) (string, bool, error) {
 		return v, true, nil
 	}
 	if !errors.Is(err, keyring.ErrNotFound) {
-		return "", false, fmt.Errorf("keychain: %w", err)
+		return "", false, keychainError(err)
 	}
 	v, ok, err := s.legacy.get(key)
 	if err != nil || !ok {
@@ -97,26 +125,26 @@ func (s keychainStore) get(key string) (string, bool, error) {
 
 // has does not migrate a token file: that happens when vault actually asks for the token.
 func (s keychainStore) has(key string) (bool, error) {
-	_, err := s.kr.Get(keyringService, key)
+	ok, err := s.kr.Has(keyringService, key)
 	switch {
-	case err == nil:
+	case err != nil:
+		return false, keychainError(err)
+	case ok:
 		return true, nil
-	case !errors.Is(err, keyring.ErrNotFound):
-		return false, fmt.Errorf("keychain: %w", err)
 	}
 	return s.legacy.has(key)
 }
 
 func (s keychainStore) set(key, value string) error {
 	if err := s.kr.Set(keyringService, key, value); err != nil {
-		return fmt.Errorf("keychain: %w", err)
+		return keychainError(err)
 	}
 	return s.legacy.del(key)
 }
 
 func (s keychainStore) del(key string) error {
 	if err := s.kr.Delete(keyringService, key); err != nil && !errors.Is(err, keyring.ErrNotFound) {
-		return fmt.Errorf("keychain: %w", err)
+		return keychainError(err)
 	}
 	return s.legacy.del(key)
 }

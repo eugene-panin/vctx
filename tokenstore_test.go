@@ -19,6 +19,11 @@ func (f fakeKeyring) Get(service, user string) (string, error) {
 	return v, nil
 }
 
+func (f fakeKeyring) Has(service, user string) (bool, error) {
+	_, ok := f[service+"/"+user]
+	return ok, nil
+}
+
 func (f fakeKeyring) Set(service, user, password string) error {
 	f[service+"/"+user] = password
 	return nil
@@ -38,10 +43,10 @@ func TestKeychainStore(t *testing.T) {
 	a.keyring = kr
 
 	// A token file from an earlier version moves into the keychain on first read.
-	if err := writeFileAtomic(a.tokenPath("dev"), []byte("old-token\n"), 0o600); err != nil {
+	if err := writeFileAtomic(a.tokenPath("dev"), []byte("https://127.0.0.1:8200\nold-token\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	a.environ = append(a.environ, "VCTX_CONTEXT=dev")
+	a.environ = withEnv(a.environ, "VCTX_CONTEXT=dev")
 	if err := a.run([]string{"get"}); err != nil {
 		t.Fatal(err)
 	}
@@ -51,7 +56,7 @@ func TestKeychainStore(t *testing.T) {
 	if _, err := os.Stat(a.tokenPath("dev")); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("token file left behind: %v", err)
 	}
-	if kr["vctx/dev"] != "old-token\n" {
+	if kr["vctx/dev"] != "https://127.0.0.1:8200\nold-token\n" {
 		t.Errorf("keychain = %v", kr)
 	}
 
@@ -76,11 +81,12 @@ func TestTokenStoreSelection(t *testing.T) {
 type brokenKeyring struct{ fakeKeyring }
 
 func (brokenKeyring) Get(string, string) (string, error) { return "", errors.New("keychain locked") }
+func (brokenKeyring) Has(string, string) (bool, error)   { return false, errors.New("keychain locked") }
 
 func TestKeychainErrorsReported(t *testing.T) {
 	a, _, _ := newTestApp(t, "VCTX_TOKEN_STORE=keychain", "VCTX_CONTEXT=dev")
 	a.keyring = brokenKeyring{fakeKeyring{}}
-	if _, err := a.tokenStatus([]string{"dev"}); err == nil || !strings.Contains(err.Error(), "locked") {
+	if _, err := a.tokenStatus([]string{"dev"}); err == nil || !strings.Contains(err.Error(), "locked") || !strings.Contains(err.Error(), "VCTX_TOKEN_STORE=file") {
 		t.Errorf("tokenStatus err = %v", err)
 	}
 	if err := a.run([]string{"get"}); err == nil {

@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 func TestTargetFor(t *testing.T) {
@@ -286,5 +288,98 @@ func TestProxyErrorKept(t *testing.T) {
 	_, err := targetFor([]string{"VAULT_ADDR=https://v", "VAULT_PROXY_ADDR=http://[::1"})
 	if err == nil || !strings.Contains(err.Error(), "missing ']'") {
 		t.Errorf("err = %v", err)
+	}
+}
+
+func TestBadAddressReported(t *testing.T) {
+	a, out, _ := newTestApp(t)
+	writeContexts(t, a, map[string]string{
+		"noscheme": "vault.example.com:8200",
+		"ok":       serve(t, vaultHandler(200, activeBody)),
+	})
+	err := a.run([]string{"check"})
+	if err == nil || !strings.Contains(err.Error(), "1 of 2") {
+		t.Fatalf("err = %v", err)
+	}
+	if !strings.Contains(out.String(), "config: VAULT_ADDR") {
+		t.Errorf("output:\n%s", out)
+	}
+
+	cfg, err := a.loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := newModel(a, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 20})
+	if view := m.View(); !strings.Contains(view, "config error") {
+		t.Errorf("UI:\n%s", view)
+	}
+	a.environ = withEnv(a.environ, "VCTX_CHECK_TIMEOUT=2s")
+	if err := a.run([]string{"noscheme", "status"}); err == nil || strings.Contains(err.Error(), "VPN") {
+		t.Errorf("exec with bad address: %v", err)
+	}
+}
+
+func TestBadProxyReported(t *testing.T) {
+	a, out, _ := newTestApp(t)
+	cfg := "contexts:\n  x:\n    VAULT_ADDR: https://v\n    VAULT_PROXY_ADDR: http://[::1\n"
+	if err := os.WriteFile(a.configPath, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.run([]string{"check"}); err == nil || !strings.Contains(out.String(), "proxy settings") {
+		t.Errorf("err = %v, output:\n%s", err, out)
+	}
+}
+
+func TestUnhealthyNodesAreVault(t *testing.T) {
+	for _, tc := range []struct {
+		status int
+		body   string
+		want   string
+		usable bool
+	}{
+		{474, `{"initialized":true,"sealed":false,"standby":true,"version":"1.20.4"}`, "1.20.4 standby", true},
+		{530, `{"initialized":true,"sealed":false,"standby":true,"removed_from_cluster":true,"version":"1.20.4"}`, "1.20.4 removed from cluster", false},
+	} {
+		addr := serve(t, vaultHandler(tc.status, tc.body))
+		r := probe(t.Context(), []string{"VAULT_ADDR=" + addr}, defaultCheckTimeout)
+		if r.err != nil || r.health.String() != tc.want || r.health.usable() != tc.usable {
+			t.Errorf("HTTP %d: err %v, health %+v", tc.status, r.err, r.health)
+		}
+		a, _, call := newTestApp(t, "VCTX_CHECK_TIMEOUT=2s")
+		writeContexts(t, a, map[string]string{"x": addr})
+		if err := a.run([]string{"x", "status"}); err != nil || call.argv0 == "" {
+			t.Errorf("HTTP %d: vault not started: %v", tc.status, err)
+		}
+	}
+}
+
+func TestInlineCACert(t *testing.T) {
+	srv := httptest.NewUnstartedServer(vaultHandler(200, activeBody))
+	srv.Config.ErrorLog = log.New(io.Discard, "", 0)
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw})
+	r := probe(t.Context(), []string{"VAULT_ADDR=" + srv.URL, "VAULT_CACERT_BYTES=" + string(pemBytes)}, defaultCheckTimeout)
+	if r.err != nil {
+		t.Errorf("VAULT_CACERT_BYTES: %v", r.err)
+	}
+}
+
+func TestReachabilityErrorsClassified(t *testing.T) {
+	plain := strings.Replace(serve(t, vaultHandler(200, activeBody)), "http://", "https://", 1)
+	a, _, _ := newTestApp(t, "VCTX_CHECK_TIMEOUT=2s")
+	writeContexts(t, a, map[string]string{"x": plain})
+	if err := a.run([]string{"x", "status"}); err == nil || !strings.Contains(err.Error(), "does not speak TLS") {
+		t.Errorf("err = %v", err)
+	}
+
+	a, _, _ = newTestApp(t, "VCTX_CHECK_TIMEOUT=2s")
+	writeContexts(t, a, map[string]string{"x": "unix://" + filepath.Join(t.TempDir(), "agent.sock")})
+	if err := a.run([]string{"x", "status"}); err == nil || !strings.Contains(err.Error(), "vault agent") {
+		t.Errorf("agent socket: %v", err)
 	}
 }

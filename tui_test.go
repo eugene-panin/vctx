@@ -51,8 +51,7 @@ func newTestModel(t *testing.T) (*model, *app) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	init := true
-	m.rows[0].status.probeResult = probeResult{health: &health{Initialized: &init, Version: "1.20.4"}, latency: 280 * time.Millisecond}
+	m.rows[0].status.probeResult = probeResult{health: &health{Initialized: true, Version: "1.20.4"}, latency: 280 * time.Millisecond}
 	m.rows[0].probing = false
 	m.rows[1].status.probeResult = probeResult{err: &notVaultError{status: 403, contentType: "text/html"}}
 	m.rows[1].probing = false
@@ -179,5 +178,21 @@ func TestScrollKeepsCursorVisible(t *testing.T) {
 	m.Update(tea.KeyMsg{Type: tea.KeyDown})
 	if view := m.View(); !strings.Contains(view, "prod") {
 		t.Errorf("selected row scrolled out:\n%s", view)
+	}
+}
+
+func TestStaleTokenStatusIgnored(t *testing.T) {
+	m, a := newTestModel(t)
+	if err := writeFileAtomic(a.tokenPath("dev"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	slow := m.loadTokens()() // started before the token is forgotten, answers after
+	m.Update(m.loadTokens()())
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
+	_, cmd = m.Update(cmd())
+	m.Update(slow)
+	m.Update(cmd())
+	if m.tokens["dev"] {
+		t.Error("late token status brought a forgotten token back")
 	}
 }

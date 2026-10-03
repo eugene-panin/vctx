@@ -27,6 +27,12 @@ import (
 
 const defaultCheckTimeout = 3 * time.Second
 
+// configError is a context setting vctx cannot use, as opposed to a network failure.
+type configError struct{ err error }
+
+func (e *configError) Error() string { return e.err.Error() }
+func (e *configError) Unwrap() error { return e.err }
+
 // target is where vault will send requests for a given environment.
 type target struct {
 	addr  *url.URL
@@ -50,14 +56,14 @@ func targetFor(env []string) (target, error) {
 	}
 	u, err := url.Parse(raw)
 	if err != nil {
-		return target{}, fmt.Errorf("parse VAULT_ADDR: %w", err)
+		return target{}, &configError{fmt.Errorf("parse VAULT_ADDR: %w", err)}
 	}
 	switch u.Scheme {
 	case "unix":
 		return target{addr: &url.URL{Scheme: "http", Host: "localhost"}, unix: u.Path}, nil
 	case "http", "https":
 	default:
-		return target{}, fmt.Errorf("VAULT_ADDR %q: unsupported scheme", raw)
+		return target{}, &configError{fmt.Errorf("VAULT_ADDR %q: want http://, https:// or unix://", raw)}
 	}
 
 	t := target{addr: u}
@@ -72,10 +78,10 @@ func targetFor(env []string) (target, error) {
 		t.proxy, err = cfg.ProxyFunc()(u)
 	}
 	if err != nil {
-		return target{}, fmt.Errorf("proxy settings for %s: %w", u.Host, err)
+		return target{}, &configError{fmt.Errorf("proxy settings for %s: %w", u.Host, err)}
 	}
 	if t.proxy != nil && t.proxy.Host == "" {
-		return target{}, fmt.Errorf("proxy settings for %s: no host in %q", u.Host, t.proxy.Redacted())
+		return target{}, &configError{fmt.Errorf("proxy settings for %s: no host in %q", u.Host, t.proxy.Redacted())}
 	}
 	return t, nil
 }
@@ -115,7 +121,8 @@ func hostPort(u *url.URL) string {
 	return net.JoinHostPort(u.Hostname(), port)
 }
 
-// tlsConfig mirrors the TLS variables the Vault CLI understands.
+// tlsConfig mirrors the TLS variables the Vault CLI understands, with the same
+// precedence for CA certificates: file, then inline PEM, then directory.
 func tlsConfig(env []string) (*tls.Config, error) {
 	cfg := &tls.Config{
 		MinVersion: tls.VersionTLS12,
@@ -125,29 +132,37 @@ func tlsConfig(env []string) (*tls.Config, error) {
 		cfg.InsecureSkipVerify = true // #nosec G402 -- explicitly requested by the context
 	}
 
-	var caFiles []string
-	if f := lookupEnv(env, "VAULT_CACERT"); f != "" {
-		caFiles = append(caFiles, f)
-	} else if dir := lookupEnv(env, "VAULT_CAPATH"); dir != "" {
+	var pems [][]byte
+	switch file, inline, dir := lookupEnv(env, "VAULT_CACERT"), lookupEnv(env, "VAULT_CACERT_BYTES"), lookupEnv(env, "VAULT_CAPATH"); {
+	case file != "":
+		pem, err := os.ReadFile(file)
+		if err != nil {
+			return nil, fmt.Errorf("read CA certificate: %w", err)
+		}
+		pems = append(pems, pem)
+	case inline != "":
+		pems = append(pems, []byte(inline))
+	case dir != "":
 		entries, err := os.ReadDir(dir)
 		if err != nil {
 			return nil, fmt.Errorf("read VAULT_CAPATH: %w", err)
 		}
 		for _, e := range entries {
-			if !e.IsDir() {
-				caFiles = append(caFiles, filepath.Join(dir, e.Name()))
+			if e.IsDir() {
+				continue
 			}
-		}
-	}
-	if len(caFiles) > 0 {
-		cfg.RootCAs = x509.NewCertPool()
-		for _, f := range caFiles {
-			pem, err := os.ReadFile(f)
+			pem, err := os.ReadFile(filepath.Join(dir, e.Name()))
 			if err != nil {
 				return nil, fmt.Errorf("read CA certificate: %w", err)
 			}
+			pems = append(pems, pem)
+		}
+	}
+	if len(pems) > 0 {
+		cfg.RootCAs = x509.NewCertPool()
+		for _, pem := range pems {
 			if !cfg.RootCAs.AppendCertsFromPEM(pem) {
-				return nil, fmt.Errorf("no certificates in %s", f)
+				return nil, errors.New("no certificates in the configured CA")
 			}
 		}
 	}
@@ -163,20 +178,51 @@ func tlsConfig(env []string) (*tls.Config, error) {
 }
 
 type health struct {
-	Initialized        *bool  `json:"initialized"`
-	Sealed             bool   `json:"sealed"`
-	Standby            bool   `json:"standby"`
-	PerformanceStandby bool   `json:"performance_standby"`
-	Version            string `json:"version"`
+	Initialized        bool
+	Sealed             bool
+	Standby            bool
+	PerformanceStandby bool
+	Removed            bool
+	Version            string
+}
+
+// decodeHealth parses a sys/health body; ok is false when it is not one.
+func decodeHealth(r io.Reader) (h health, ok bool) {
+	var wire struct {
+		Initialized        *bool  `json:"initialized"`
+		Sealed             bool   `json:"sealed"`
+		Standby            bool   `json:"standby"`
+		PerformanceStandby bool   `json:"performance_standby"`
+		Removed            bool   `json:"removed_from_cluster"`
+		Version            string `json:"version"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r, 64<<10)).Decode(&wire); err != nil || wire.Initialized == nil {
+		return health{}, false
+	}
+	return health{
+		Initialized:        *wire.Initialized,
+		Sealed:             wire.Sealed,
+		Standby:            wire.Standby,
+		PerformanceStandby: wire.PerformanceStandby,
+		Removed:            wire.Removed,
+		Version:            sanitize(wire.Version, 40),
+	}, true
+}
+
+// usable reports whether vault commands can work against this node right now.
+func (h health) usable() bool {
+	return h.Initialized && !h.Sealed && !h.Removed
 }
 
 func (h health) String() string {
 	state := "active"
 	switch {
-	case !*h.Initialized:
+	case !h.Initialized:
 		state = "not initialized"
 	case h.Sealed:
 		state = "sealed"
+	case h.Removed:
+		state = "removed from cluster"
 	case h.PerformanceStandby:
 		state = "perf standby"
 	case h.Standby:
@@ -233,7 +279,7 @@ func probe(ctx context.Context, env []string, timeout time.Duration) probeResult
 	}
 	tlsCfg, err := tlsConfig(env)
 	if err != nil {
-		return probeResult{err: err}
+		return probeResult{err: &configError{err}}
 	}
 	tr := &http.Transport{
 		Proxy:             func(*http.Request) (*url.URL, error) { return t.proxy, nil },
@@ -267,6 +313,11 @@ func probe(ctx context.Context, env []string, timeout time.Duration) probeResult
 	defer resp.Body.Close()
 	latency := time.Since(start)
 
+	// sys/health signals node state through many status codes (429 standby,
+	// 503 sealed, 474 HA unhealthy, 530 removed, ...); the body tells Vault apart.
+	if h, ok := decodeHealth(resp.Body); ok {
+		return probeResult{health: &h, latency: latency}
+	}
 	notVault := &notVaultError{status: resp.StatusCode, contentType: sanitize(resp.Header.Get("Content-Type"), 40)}
 	if notVault.contentType == "" {
 		notVault.contentType = "no content type"
@@ -274,17 +325,7 @@ func probe(ctx context.Context, env []string, timeout time.Duration) probeResult
 	if loc, err := resp.Location(); err == nil {
 		notVault.location = sanitize(loc.Host, 60)
 	}
-	switch resp.StatusCode {
-	case 200, 429, 472, 473, 501, 503:
-	default:
-		return probeResult{err: notVault}
-	}
-	var h health
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&h); err != nil || h.Initialized == nil {
-		return probeResult{err: notVault}
-	}
-	h.Version = sanitize(h.Version, 40)
-	return probeResult{health: &h, latency: latency}
+	return probeResult{err: notVault}
 }
 
 // isTLSError reports a failed TLS handshake: a certificate the client rejects,
@@ -307,11 +348,14 @@ func isTLSAlert(err error) bool {
 // classify describes err twice: a compact label for tables and a full explanation.
 // Error text can carry server or certificate data, so it is sanitized.
 func classify(err error) (short, long string) {
+	var cfgErr *configError
 	var nv *notVaultError
 	var dnsErr *net.DNSError
 	var recErr tls.RecordHeaderError
 	var netErr net.Error
 	switch {
+	case errors.As(err, &cfgErr):
+		return "config error", "config: " + sanitize(cfgErr.Error(), 300)
 	case errors.As(err, &nv):
 		return fmt.Sprintf("blocked (HTTP %d)", nv.status), "blocked: " + nv.Error()
 	case isTLSError(err):
@@ -339,6 +383,29 @@ func classify(err error) (short, long string) {
 	return "error", sanitize(err.Error(), 300)
 }
 
+// networkProblem reports whether err comes from the network path to Vault
+// rather than from the local configuration or a TLS handshake.
+func networkProblem(err error) bool {
+	var cfgErr *configError
+	if isTLSError(err) || errors.As(err, &cfgErr) {
+		return false
+	}
+	var nv *notVaultError
+	var opErr *net.OpError
+	var dnsErr *net.DNSError
+	var netErr net.Error
+	return errors.As(err, &nv) || errors.As(err, &opErr) || errors.As(err, &dnsErr) ||
+		errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &netErr) && netErr.Timeout())
+}
+
+// networkHint suggests what to check when the path to a target is broken.
+func networkHint(unix bool) string {
+	if unix {
+		return "is vault agent running?"
+	}
+	return "is the VPN/tunnel up?"
+}
+
 // checkTimeout reads VCTX_CHECK_TIMEOUT; zero disables the check.
 func (a *app) checkTimeout() (time.Duration, error) {
 	v := a.getenv("VCTX_CHECK_TIMEOUT")
@@ -356,37 +423,27 @@ func (a *app) checkTimeout() (time.Duration, error) {
 }
 
 // ensureReachable fails fast when the Vault API of context name cannot be reached with env.
-// TLS problems and a sealed Vault are left for vault itself to report.
+// TLS problems and an unusable node are left for vault itself to report.
 func (a *app) ensureReachable(name string, env []string) error {
 	timeout, err := a.checkTimeout()
 	if err != nil || timeout == 0 {
 		return err
 	}
+	t, err := targetFor(env)
+	if err != nil {
+		_, long := classify(err)
+		return fmt.Errorf("context %s: %s", name, long)
+	}
 	r := probe(context.Background(), env, timeout)
-	switch {
-	case r.err == nil || isTLSError(r.err):
+	if r.err == nil || isTLSError(r.err) {
 		return nil
-	case !networkProblem(r.err):
-		return fmt.Errorf("context %s: %w", name, r.err)
 	}
-	t, _ := targetFor(env)
 	_, long := classify(r.err)
-	return fmt.Errorf("context %s: %s %s\n"+
-		"is the VPN/tunnel up? set VCTX_CHECK_TIMEOUT=0 to skip this check", name, t, long)
-}
-
-// networkProblem reports whether err comes from the network path to Vault
-// rather than from the local configuration.
-func networkProblem(err error) bool {
-	var nv *notVaultError
-	var opErr *net.OpError
-	var dnsErr *net.DNSError
-	var netErr net.Error
-	if isTLSError(err) {
-		return false
+	if !networkProblem(r.err) {
+		return fmt.Errorf("context %s: %s", name, long)
 	}
-	return errors.As(err, &nv) || errors.As(err, &opErr) || errors.As(err, &dnsErr) ||
-		errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &netErr) && netErr.Timeout())
+	return fmt.Errorf("context %s: %s %s\n%s set VCTX_CHECK_TIMEOUT=0 to skip this check",
+		name, t, long, networkHint(t.unix != ""))
 }
 
 // contextStatus is the probe outcome of one context.
@@ -394,6 +451,7 @@ type contextStatus struct {
 	name    string
 	target  string
 	display string
+	unix    bool
 	probeResult
 }
 
@@ -412,7 +470,7 @@ func (s contextStatus) summary() (string, level) {
 	case s.err != nil:
 		_, long := classify(s.err)
 		return long, levelFail
-	case s.health.Sealed || !*s.health.Initialized:
+	case !s.health.usable():
 		return s.health.String(), levelWarn
 	}
 	return "ok " + s.health.String(), levelOK
@@ -434,37 +492,39 @@ func (s contextStatus) latencyText() string {
 	return fmt.Sprintf("%dms", max(s.latency.Milliseconds(), 1))
 }
 
-// prepareProbes resolves the environment of each context; probing itself happens in run.
-func (a *app) prepareProbes(cfg *config, names []string) (run func() []contextStatus, err error) {
-	timeout, err := a.checkTimeout()
+// prepare resolves what probing context name needs. An address vctx cannot
+// use ends up in the status, so one bad context does not hide the others.
+func (a *app) prepare(cfg *config, name string) (contextStatus, []string, error) {
+	vars, err := a.contextVars(cfg, name)
 	if err != nil {
-		return nil, err
+		return contextStatus{}, nil, err
 	}
-	if timeout == 0 {
-		timeout = defaultCheckTimeout
+	env := applyEnv(a.environ, vars)
+	s := contextStatus{name: name}
+	t, err := targetFor(env)
+	if err != nil {
+		s.display = sanitize(vaultAddr(vars), 60)
+		s.target = s.display
+		s.err = err
+		return s, env, nil
 	}
-	envs := make([][]string, len(names))
-	for i, name := range names {
-		vars, err := a.contextVars(cfg, name)
-		if err != nil {
-			return nil, err
-		}
-		envs[i] = applyEnv(a.environ, vars)
-	}
-	return func() []contextStatus {
-		out := make([]contextStatus, len(names))
-		var wg sync.WaitGroup
-		for i, name := range names {
-			t, _ := targetFor(envs[i])
-			out[i] = contextStatus{name: name, target: t.String(), display: t.display()}
-			wg.Go(func() { out[i].probeResult = probe(context.Background(), envs[i], timeout) })
-		}
-		wg.Wait()
-		return out
-	}, nil
+	s.target, s.display, s.unix = t.String(), t.display(), t.unix != ""
+	return s, env, nil
 }
 
-// check probes the given contexts, or all of them, concurrently and prints a status table.
+// probeAll probes, concurrently, every context whose address could be resolved.
+func probeAll(statuses []contextStatus, envs [][]string, timeout time.Duration) {
+	var wg sync.WaitGroup
+	for i := range statuses {
+		if statuses[i].err != nil {
+			continue
+		}
+		wg.Go(func() { statuses[i].probeResult = probe(context.Background(), envs[i], timeout) })
+	}
+	wg.Wait()
+}
+
+// check probes the given contexts, or all of them, and prints a status table.
 func (a *app) check(args []string) error {
 	cfg, err := a.loadConfig()
 	if err != nil {
@@ -474,12 +534,21 @@ func (a *app) check(args []string) error {
 	if len(names) == 0 {
 		names = slices.Sorted(maps.Keys(cfg.Contexts))
 	}
-	run, err := a.prepareProbes(cfg, names)
+	timeout, err := a.checkTimeout()
 	if err != nil {
 		return err
 	}
-	var statuses []contextStatus
-	a.withSpinner(fmt.Sprintf("checking %d instances", len(names)), func() { statuses = run() })
+	if timeout == 0 {
+		timeout = defaultCheckTimeout
+	}
+	statuses := make([]contextStatus, len(names))
+	envs := make([][]string, len(names))
+	for i, name := range names {
+		if statuses[i], envs[i], err = a.prepare(cfg, name); err != nil {
+			return err
+		}
+	}
+	a.withSpinner(fmt.Sprintf("checking %d instances", len(names)), func() { probeAll(statuses, envs, timeout) })
 
 	if a.stdoutTTY {
 		current, _ := a.contextName("")

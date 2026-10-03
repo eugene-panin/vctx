@@ -165,7 +165,7 @@ func (a *app) renderStatusTable(statuses []contextStatus, current string) string
 		})
 	}
 
-	var failed, network bool
+	var failed, network, agent bool
 	for i, s := range statuses {
 		if s.err == nil {
 			continue
@@ -174,14 +174,20 @@ func (a *app) renderStatusTable(statuses []contextStatus, current string) string
 			b.WriteString("\n")
 			failed = true
 		}
-		network = network || networkProblem(s.err)
+		if networkProblem(s.err) {
+			network = network || !s.unix
+			agent = agent || s.unix
+		}
 		_, long := classify(s.err)
 		text := lipgloss.NewStyle().Width(max(width-2, 20)).Render(s.name + " " + long)
 		name, rest, _ := strings.Cut(text, " ")
 		fmt.Fprintf(&b, "%s %s %s\n", p.level(levels[i]).Render("✗"), p.bold.Render(name), p.dim.Render(strings.ReplaceAll(rest, "\n", "\n  ")))
 	}
 	if network {
-		b.WriteString(p.dim.Render("  is the VPN/tunnel up?") + "\n")
+		b.WriteString(p.dim.Render("  "+networkHint(false)) + "\n")
+	}
+	if agent {
+		b.WriteString(p.dim.Render("  "+networkHint(true)) + "\n")
 	}
 	if tokenErr != nil {
 		fmt.Fprintf(&b, "\n%s %s\n", p.warn.Render("!"), p.dim.Render("token status: "+tokenErr.Error()))

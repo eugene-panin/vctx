@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"path/filepath"
@@ -66,7 +67,7 @@ func (a *app) tokenHelper(op string) error {
 		case !bound && strings.Contains(addr, "://"):
 			return nil // an address with an empty token
 		case !bound:
-			token = addr // stored before tokens were bound to an address
+			return errors.New("the stored token predates address binding; log in again")
 		case strings.TrimSpace(addr) != a.callerAddr():
 			return fmt.Errorf("the stored token is for %s, not %s; log in again", strings.TrimSpace(addr), a.callerAddr())
 		}

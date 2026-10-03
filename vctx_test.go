@@ -25,6 +25,11 @@ contexts:
     HTTPS_PROXY: http://proxy:3128
 `
 
+// withEnv returns env with kvs taking precedence; the first occurrence of a key wins.
+func withEnv(env []string, kvs ...string) []string {
+	return append(slices.Clip(kvs), env...)
+}
+
 type execCall struct {
 	argv0 string
 	argv  []string
@@ -45,7 +50,7 @@ func newTestApp(t *testing.T, environ ...string) (*app, *bytes.Buffer, *execCall
 		configPath: cfg,
 		stateDir:   filepath.Join(dir, "state"),
 		self:       "/usr/local/bin/vctx",
-		environ:    append([]string{"PATH=" + os.Getenv("PATH"), "VCTX_VAULT_BIN=/bin/sh", "VCTX_CHECK_TIMEOUT=0", "VCTX_TOKEN_STORE=file"}, environ...),
+		environ:    withEnv([]string{"PATH=" + os.Getenv("PATH"), "VCTX_VAULT_BIN=/bin/sh", "VCTX_CHECK_TIMEOUT=0", "VCTX_TOKEN_STORE=file"}, environ...),
 		stdin:      strings.NewReader(""),
 		stdout:     &out,
 		stderr:     &bytes.Buffer{},
@@ -158,7 +163,7 @@ func TestEnvShell(t *testing.T) {
 	}
 
 	out.Reset()
-	a.environ = append(a.environ, "VCTX_VARS=HTTPS_PROXY", "HTTPS_PROXY=p", "VCTX_CONTEXT=prod")
+	a.environ = withEnv(a.environ, "VCTX_VARS=HTTPS_PROXY", "HTTPS_PROXY=p", "VCTX_CONTEXT=prod")
 	if err := a.run([]string{"env", "--clear"}); err != nil {
 		t.Fatal(err)
 	}
@@ -181,7 +186,7 @@ func TestTokenHelperIsolation(t *testing.T) {
 	helper := func(op, input string, env ...string) string {
 		t.Helper()
 		out.Reset()
-		a.environ = append(slices.Clip(base), env...)
+		a.environ = withEnv(base, env...)
 		a.stdin = strings.NewReader(input)
 		if err := a.run([]string{op}); err != nil {
 			t.Fatal(err)
@@ -230,12 +235,13 @@ func TestVaultConfigRejectsUnsafePath(t *testing.T) {
 	for _, self := range []string{"/Users/me/My Tools/vctx", "/opt/{a,b}/vctx", "/tmp/$(id)/vctx"} {
 		a, _, _ := newTestApp(t)
 		a.self = self
-		if err := a.run([]string{"dev", "status"}); err == nil {
-			t.Errorf("%s accepted as token helper path", self)
+		writeContexts(t, a, map[string]string{"dev": serve(t, vaultHandler(200, activeBody))})
+		if err := a.run([]string{"dev", "status"}); err == nil || !strings.Contains(err.Error(), "token helper") {
+			t.Errorf("%s accepted as token helper path: %v", self, err)
 		}
 		// Probing needs no token helper.
-		if err := a.run([]string{"check", "dev"}); err != nil && strings.Contains(err.Error(), "token helper") {
-			t.Errorf("%s: check needs the helper: %v", self, err)
+		if err := a.run([]string{"check", "dev"}); err != nil {
+			t.Errorf("%s: check failed: %v", self, err)
 		}
 	}
 }
@@ -246,7 +252,7 @@ func TestTokenBoundToAddress(t *testing.T) {
 	helper := func(op, input string, env ...string) string {
 		t.Helper()
 		out.Reset()
-		a.environ = append(slices.Clip(base), env...)
+		a.environ = withEnv(base, env...)
 		a.stdin = strings.NewReader(input)
 		if err := a.run([]string{op}); err != nil {
 			t.Fatal(err)
@@ -259,7 +265,7 @@ func TestTokenBoundToAddress(t *testing.T) {
 		t.Errorf("same address: %q", got)
 	}
 	out.Reset()
-	a.environ = append(slices.Clip(base), "VCTX_CONTEXT=dev", "VAULT_ADDR=https://evil.example.com")
+	a.environ = withEnv(base, "VCTX_CONTEXT=dev", "VAULT_ADDR=https://evil.example.com")
 	if err := a.run([]string{"get"}); err == nil || out.Len() > 0 {
 		t.Errorf("token handed to another address: err %v, out %q", err, out)
 	}
@@ -277,11 +283,14 @@ func TestTokenBoundToAddress(t *testing.T) {
 		t.Errorf("empty store left %q", got)
 	}
 
+	// A token stored without an address could belong to any server.
 	if err := os.WriteFile(a.tokenPath("prod"), []byte("legacy\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if got := helper("get", "", "VCTX_CONTEXT=prod", "VAULT_ADDR=https://anything"); got != "legacy" {
-		t.Errorf("legacy token file: %q", got)
+	out.Reset()
+	a.environ = withEnv(base, "VCTX_CONTEXT=prod", "VAULT_ADDR=https://anything")
+	if err := a.run([]string{"get"}); err == nil || out.Len() > 0 {
+		t.Errorf("unbound token handed out: err %v, out %q", err, out)
 	}
 }
 
@@ -296,7 +305,7 @@ func TestContextNameRejectsPaths(t *testing.T) {
 			t.Errorf("%v succeeded", args)
 		}
 	}
-	a.environ = append(a.environ, "VCTX_CONTEXT=../../victim")
+	a.environ = withEnv(a.environ, "VCTX_CONTEXT=../../victim")
 	if err := a.run([]string{"logout"}); err == nil || !strings.Contains(err.Error(), "invalid context name") {
 		t.Errorf("logout with bad $VCTX_CONTEXT: %v", err)
 	}
@@ -431,5 +440,64 @@ func TestListShowsDefaults(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "shared") {
 		t.Errorf("namespace from defaults missing:\n%s", out)
+	}
+}
+
+func TestAddressFlagRefused(t *testing.T) {
+	a, _, call := newTestApp(t, "VCTX_VAULT_BIN=vault")
+	for _, args := range [][]string{
+		{"dev", "token", "lookup", "-address=http://other"},
+		{"dev", "login", "-address", "http://other"},
+		{"dev", "kv", "get", "--agent-address=http://other", "x"},
+		{"exec", "dev", "--", "vault", "-address=http://other", "status"},
+	} {
+		*call = execCall{}
+		if err := a.run(args); err == nil || !strings.Contains(err.Error(), "another server") || call.argv0 != "" {
+			t.Errorf("%q: err %v, ran %v", args, err, call.argv0 != "")
+		}
+	}
+	if got := addressFlag([]string{"kv", "put", "x", "--", "-address=literal"}); got != "" {
+		t.Errorf("value after -- treated as a flag: %q", got)
+	}
+}
+
+func TestAddrFromDefaults(t *testing.T) {
+	a, out, _ := newTestApp(t)
+	cfg := "defaults:\n  VAULT_ADDR: https://vault.example.com\ncontexts:\n  team-a:\n    VAULT_NAMESPACE: a\n  team-b:\n    VAULT_NAMESPACE: b\n"
+	if err := os.WriteFile(a.configPath, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.run([]string{"ls"}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(out.String(), "https://vault.example.com") != 2 {
+		t.Errorf("ls:\n%s", out)
+	}
+}
+
+func TestConfigSizeLimit(t *testing.T) {
+	a, _, _ := newTestApp(t)
+	big := "contexts:\n  dev:\n    VAULT_ADDR: http://v\n#" + strings.Repeat("x", 1<<20) + "\n"
+	if err := os.WriteFile(a.configPath, []byte(big), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.run([]string{"ls"}); err == nil || !strings.Contains(err.Error(), "larger than") {
+		t.Errorf("err = %v", err)
+	}
+}
+
+func TestMoreUsageErrors(t *testing.T) {
+	a, _, _ := newTestApp(t)
+	var usage usageError
+	for _, args := range [][]string{{"env", "--bogus"}, {"nosuchcommand"}, {"use"}} {
+		if err := a.run(args); !errors.As(err, &usage) {
+			t.Errorf("%q: err = %v, want a usage error", args, err)
+		}
+	}
+}
+
+func TestLookupEnvFirstWins(t *testing.T) {
+	if got := lookupEnv([]string{"A=1", "A=2"}, "A"); got != "1" {
+		t.Errorf("got %q", got)
 	}
 }

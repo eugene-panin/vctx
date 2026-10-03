@@ -51,7 +51,10 @@ so a VPN or tunnel that is down, or an ingress rejecting your IP, fails in
 seconds. VCTX_CHECK_TIMEOUT sets the timeout (default 3s), 0 disables it.
 
 Inherited VAULT_* variables are dropped before a context is applied, so an
-address or token of one instance never leaks into another.
+address or token of one instance never leaks into another. vctx refuses vault's
+-address and -agent-address flags: the token helper cannot see them and would
+hand the context's token to that server. In a shell set up with 'vctx env'
+nothing stops them, so do not pass them there.
 
 Tokens from 'vault login' are stored per context and bound to the address
 they were issued for: in the macOS Keychain by default, in files under
@@ -112,8 +115,12 @@ func newApp() (*app, error) {
 	if err != nil {
 		return nil, err
 	}
-	if p, err := filepath.EvalSymlinks(self); err == nil {
-		self = p
+	// Keep the path as invoked: a package manager's symlink survives upgrades,
+	// the versioned file it points to does not. Resolve only if that path is unusable.
+	if !helperPathRe.MatchString(self) {
+		if p, err := filepath.EvalSymlinks(self); err == nil {
+			self = p
+		}
 	}
 	a := &app{
 		home:      home,
@@ -232,7 +239,7 @@ func (a *app) run(args []string) error {
 			return err
 		}
 		if _, ok := cfg.Contexts[cmd]; !ok {
-			return fmt.Errorf("unknown command or context %q, see 'vctx help'", cmd)
+			return usageError(fmt.Sprintf("unknown command or context %q, see 'vctx help'", cmd))
 		}
 		return a.execWith(cfg, cmd, append([]string{a.vaultBin()}, rest...))
 	}
@@ -251,6 +258,22 @@ func splitExec(args []string) (string, []string) {
 		argv = argv[1:]
 	}
 	return name, argv
+}
+
+// addressFlag returns a vault flag that points vault at another server than the
+// context's. The token helper sees only the environment, not flags, so it would
+// hand the context's token to that server.
+func addressFlag(args []string) string {
+	for _, arg := range args {
+		if arg == "--" {
+			break
+		}
+		name, _, _ := strings.Cut(strings.TrimLeft(arg, "-"), "=")
+		if strings.HasPrefix(arg, "-") && (name == "address" || name == "agent-address") {
+			return arg
+		}
+	}
+	return ""
 }
 
 func (a *app) vaultBin() string {
@@ -348,7 +371,7 @@ func (a *app) env(args []string) error {
 		writeShellEnv(a.stdout, a.environ, nil)
 		return nil
 	}
-	if len(args) > 1 {
+	if len(args) > 1 || len(args) == 1 && strings.HasPrefix(args[0], "-") {
 		return usageError("vctx env [<context> | --clear]")
 	}
 	var arg string
@@ -387,6 +410,11 @@ func (a *app) execIn(arg string, argv []string) error {
 }
 
 func (a *app) execWith(cfg *config, name string, argv []string) error {
+	if filepath.Base(argv[0]) == filepath.Base(a.vaultBin()) {
+		if flag := addressFlag(argv[1:]); flag != "" {
+			return fmt.Errorf("%s would send the %s token to another server; set the address in the context instead", flag, name)
+		}
+	}
 	vars, err := a.contextVars(cfg, name)
 	if err != nil {
 		return err
