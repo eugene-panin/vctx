@@ -15,16 +15,11 @@ import (
 	"github.com/charmbracelet/x/term"
 )
 
-// errAborted and errSilent end the program with a non-zero code but no message:
-// the user cancelled, or the failure is already on screen.
-var (
-	errAborted = errors.New("aborted")
-	errSilent  = errors.New("failed")
-)
+// errSilent ends the program with status 1 but no message: the failure is already on screen.
+var errSilent = errors.New("failed")
 
-func isTerminal(v any) bool {
-	f, ok := v.(*os.File)
-	return ok && term.IsTerminal(f.Fd())
+func isTerminal(f *os.File) bool {
+	return term.IsTerminal(f.Fd())
 }
 
 func terminalWidth(w io.Writer) int {
@@ -67,10 +62,11 @@ func (p palette) level(l level) lipgloss.Style {
 }
 
 // withSpinner runs fn, animating a spinner on stderr when it is a terminal.
-func (a *app) withSpinner(title string, fn func() []contextStatus) []contextStatus {
+func (a *app) withSpinner(title string, fn func()) {
 	f, ok := a.stderr.(*os.File)
-	if !ok || !isTerminal(f) {
-		return fn()
+	if !ok || !a.stderrTTY {
+		fn()
+		return
 	}
 	p := newPalette(f)
 	done := make(chan struct{})
@@ -89,10 +85,9 @@ func (a *app) withSpinner(title string, fn func() []contextStatus) []contextStat
 			}
 		}
 	})
-	out := fn()
+	fn()
 	close(done)
 	wg.Wait()
-	return out
 }
 
 // statusColumns lays out contexts as table columns; the first is the current-context marker.
@@ -130,7 +125,8 @@ func (a *app) renderStatusTable(statuses []contextStatus, current string) string
 	for i, s := range statuses {
 		names[i] = s.name
 	}
-	cols, levels := statusColumns(statuses, current, a.tokenStatus(names))
+	tokens, tokenErr := a.tokenStatus(names)
+	cols, levels := statusColumns(statuses, current, tokens)
 	width := terminalWidth(a.stdout)
 	if width <= 0 {
 		width = 100
@@ -187,13 +183,17 @@ func (a *app) renderStatusTable(statuses []contextStatus, current string) string
 	if network {
 		b.WriteString(p.dim.Render("  is the VPN/tunnel up?") + "\n")
 	}
+	if tokenErr != nil {
+		fmt.Fprintf(&b, "\n%s %s\n", p.warn.Render("!"), p.dim.Render("token status: "+tokenErr.Error()))
+	}
 	return strings.TrimSuffix(b.String(), "\n")
 }
 
 func (a *app) printUsing(name string, cfg *config) {
-	addr := cfg.Contexts[name]["VAULT_ADDR"]
+	vars, _ := cfg.vars(name, a.home)
+	addr := vaultAddr(vars)
 	override := a.shellOverride(name)
-	if !isTerminal(a.stderr) {
+	if !a.stderrTTY {
 		fmt.Fprintf(a.stderr, "using %s (%s)\n", name, addr)
 		if override != "" {
 			fmt.Fprintf(a.stderr, "note: this shell has %s=%s, it takes precedence\n", envContext, override)

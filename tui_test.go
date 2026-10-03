@@ -118,8 +118,16 @@ func TestForgetToken(t *testing.T) {
 	if err := writeFileAtomic(a.tokenPath("dev"), []byte("t"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	m.refreshTokens() // as after a login
-	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
+	m.Update(m.loadTokens()()) // as after a login
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
+	if cmd == nil {
+		t.Fatal("x did nothing")
+	}
+	_, cmd = m.Update(cmd())
+	m.Update(cmd())
+	if m.tokens["dev"] {
+		t.Error("token still shown")
+	}
 	if _, err := os.Stat(a.tokenPath("dev")); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("token still present: %v", err)
 	}
@@ -140,5 +148,36 @@ func TestStaleProbeIgnored(t *testing.T) {
 	m.Update(probeMsg{i: 0, gen: m.rows[0].gen, res: probeResult{err: errors.New("new")}})
 	if m.rows[0].probing || m.rows[0].status.err == nil || m.rows[0].status.err.Error() != "new" {
 		t.Errorf("current answer not applied: probing=%v err=%v", m.rows[0].probing, m.rows[0].status.err)
+	}
+}
+
+func TestDisplayValue(t *testing.T) {
+	tests := []struct{ key, value, want string }{
+		{"VAULT_TOKEN", "hvs.secret", "•••"},
+		{"DB_PASSWORD", "x", "•••"},
+		{"HTTPS_PROXY", "http://user:pass@proxy:3128", "http://user:xxxxx@proxy:3128"},
+		{"VAULT_NAMESPACE", "admin", "admin"},
+	}
+	for _, tc := range tests {
+		if got := displayValue(tc.key, tc.value); got != tc.want {
+			t.Errorf("%s: got %q, want %q", tc.key, got, tc.want)
+		}
+	}
+}
+
+func TestDetailShowsDefaults(t *testing.T) {
+	m, _ := newTestModel(t)
+	m.Update(tea.WindowSizeMsg{Width: 150, Height: 30})
+	if view := m.View(); !strings.Contains(view, "VAULT_FORMAT=json") {
+		t.Errorf("defaults missing from details:\n%s", view)
+	}
+}
+
+func TestScrollKeepsCursorVisible(t *testing.T) {
+	m, _ := newTestModel(t)
+	m.Update(tea.WindowSizeMsg{Width: 60, Height: 7})
+	m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	if view := m.View(); !strings.Contains(view, "prod") {
+		t.Errorf("selected row scrolled out:\n%s", view)
 	}
 }

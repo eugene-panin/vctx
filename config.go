@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"maps"
 	"os"
 	"path/filepath"
@@ -30,13 +31,23 @@ var (
 )
 
 func loadConfig(path string) (*config, error) {
-	b, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
-	if err := checkPrivate(path); err != nil {
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("read config: %w", err)
+	}
+	if err := checkPrivate(path, fi); err != nil {
 		return nil, err
 	}
+	b, err := io.ReadAll(io.LimitReader(f, 1<<20))
+	if err != nil {
+		return nil, fmt.Errorf("read config: %w", err)
+	}
+
 	var c config
 	dec := yaml.NewDecoder(bytes.NewReader(b))
 	dec.KnownFields(true)
@@ -57,21 +68,25 @@ func loadConfig(path string) (*config, error) {
 		if err := checkVars(vars); err != nil {
 			return nil, fmt.Errorf("%s: context %s: %w", path, name, err)
 		}
-		if vars["VAULT_ADDR"] == "" {
+		if vaultAddr(vars) == "" {
 			return nil, fmt.Errorf("%s: context %s: VAULT_ADDR is required", path, name)
 		}
 	}
 	return &c, nil
 }
 
+// vaultAddr is the address vault talks to for vars: VAULT_AGENT_ADDR wins over VAULT_ADDR, as in the Vault CLI.
+func vaultAddr(vars map[string]string) string {
+	if addr := vars["VAULT_AGENT_ADDR"]; addr != "" {
+		return addr
+	}
+	return vars["VAULT_ADDR"]
+}
+
 // checkPrivate refuses a file or directory another user could modify, as ssh does:
 // the config decides which variables (PATH included) vault runs with, and the
 // state directory holds the token helper setting vault executes.
-func checkPrivate(path string) error {
-	fi, err := os.Stat(path)
-	if err != nil {
-		return err
-	}
+func checkPrivate(path string, fi fs.FileInfo) error {
 	if perm := fi.Mode().Perm(); perm&0o022 != 0 {
 		return fmt.Errorf("%s is writable by group or others (mode %04o), fix with: chmod go-w %s", path, perm, path)
 	}

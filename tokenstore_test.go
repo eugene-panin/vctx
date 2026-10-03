@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/zalando/go-keyring"
@@ -54,8 +55,8 @@ func TestKeychainStore(t *testing.T) {
 		t.Errorf("keychain = %v", kr)
 	}
 
-	if got := a.tokenStatus([]string{"dev", "prod"}); !got["dev"] || got["prod"] {
-		t.Errorf("token status = %v", got)
+	if got, err := a.tokenStatus([]string{"dev", "prod"}); err != nil || !got["dev"] || got["prod"] {
+		t.Errorf("token status = %v, %v", got, err)
 	}
 	if err := a.run([]string{"logout", "dev"}); err != nil {
 		t.Fatal(err)
@@ -69,5 +70,35 @@ func TestTokenStoreSelection(t *testing.T) {
 	a, _, _ := newTestApp(t, "VCTX_TOKEN_STORE=vault")
 	if _, err := a.tokens(); err == nil {
 		t.Error("unknown store accepted")
+	}
+}
+
+type brokenKeyring struct{ fakeKeyring }
+
+func (brokenKeyring) Get(string, string) (string, error) { return "", errors.New("keychain locked") }
+
+func TestKeychainErrorsReported(t *testing.T) {
+	a, _, _ := newTestApp(t, "VCTX_TOKEN_STORE=keychain", "VCTX_CONTEXT=dev")
+	a.keyring = brokenKeyring{fakeKeyring{}}
+	if _, err := a.tokenStatus([]string{"dev"}); err == nil || !strings.Contains(err.Error(), "locked") {
+		t.Errorf("tokenStatus err = %v", err)
+	}
+	if err := a.run([]string{"get"}); err == nil {
+		t.Error("get hid a keychain failure")
+	}
+}
+
+func TestHasDoesNotMigrate(t *testing.T) {
+	a, _, _ := newTestApp(t, "VCTX_TOKEN_STORE=keychain")
+	kr := fakeKeyring{}
+	a.keyring = kr
+	if err := writeFileAtomic(a.tokenPath("dev"), []byte("t"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := a.tokenStatus([]string{"dev"}); err != nil || !got["dev"] {
+		t.Fatalf("status = %v, %v", got, err)
+	}
+	if len(kr) != 0 {
+		t.Errorf("status check migrated the token: %v", kr)
 	}
 }

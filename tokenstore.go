@@ -13,9 +13,10 @@ import (
 
 const keyringService = "vctx"
 
-// tokenStore keeps one secret per key; keys are context names or "by-addr/<hash>".
+// tokenStore keeps one secret per key; keys are context names or "_addr/<hash>".
 type tokenStore interface {
 	get(key string) (value string, ok bool, err error)
+	has(key string) (bool, error)
 	set(key, value string) error
 	del(key string) error
 }
@@ -33,6 +34,14 @@ func (s fileStore) get(key string) (string, bool, error) {
 		return "", false, err
 	}
 	return string(b), true, nil
+}
+
+func (s fileStore) has(key string) (bool, error) {
+	_, err := os.Stat(s.path(key))
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 func (s fileStore) set(key, value string) error {
@@ -86,6 +95,18 @@ func (s keychainStore) get(key string) (string, bool, error) {
 	return v, true, nil
 }
 
+// has does not migrate a token file: that happens when vault actually asks for the token.
+func (s keychainStore) has(key string) (bool, error) {
+	_, err := s.kr.Get(keyringService, key)
+	switch {
+	case err == nil:
+		return true, nil
+	case !errors.Is(err, keyring.ErrNotFound):
+		return false, fmt.Errorf("keychain: %w", err)
+	}
+	return s.legacy.has(key)
+}
+
 func (s keychainStore) set(key, value string) error {
 	if err := s.kr.Set(keyringService, key, value); err != nil {
 		return fmt.Errorf("keychain: %w", err)
@@ -124,15 +145,21 @@ func (a *app) tokens() (tokenStore, error) {
 	return nil, fmt.Errorf("invalid VCTX_TOKEN_STORE %q, want file or keychain", kind)
 }
 
-// tokenStatus reports which contexts have a stored token.
-func (a *app) tokenStatus(names []string) map[string]bool {
+// tokenStatus reports which contexts have a stored token; on error the map
+// still holds every answer that could be got.
+func (a *app) tokenStatus(names []string) (map[string]bool, error) {
 	out := make(map[string]bool, len(names))
 	store, err := a.tokens()
 	if err != nil {
-		return out
+		return out, err
 	}
+	var errs []error
 	for _, name := range names {
-		_, out[name], _ = store.get(name)
+		ok, err := store.has(name)
+		out[name] = ok
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", name, err))
+		}
 	}
-	return out
+	return out, errors.Join(errs...)
 }

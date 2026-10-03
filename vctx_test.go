@@ -2,11 +2,14 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 const testConfig = `
@@ -224,10 +227,16 @@ func TestTokenHelperIsolation(t *testing.T) {
 }
 
 func TestVaultConfigRejectsUnsafePath(t *testing.T) {
-	a, _, _ := newTestApp(t)
-	a.self = "/Users/me/My Tools/vctx"
-	if err := a.run([]string{"dev", "status"}); err == nil {
-		t.Fatal("expected error for helper path with a space")
+	for _, self := range []string{"/Users/me/My Tools/vctx", "/opt/{a,b}/vctx", "/tmp/$(id)/vctx"} {
+		a, _, _ := newTestApp(t)
+		a.self = self
+		if err := a.run([]string{"dev", "status"}); err == nil {
+			t.Errorf("%s accepted as token helper path", self)
+		}
+		// Probing needs no token helper.
+		if err := a.run([]string{"check", "dev"}); err != nil && strings.Contains(err.Error(), "token helper") {
+			t.Errorf("%s: check needs the helper: %v", self, err)
+		}
 	}
 }
 
@@ -249,8 +258,23 @@ func TestTokenBoundToAddress(t *testing.T) {
 	if got := helper("get", "", "VCTX_CONTEXT=dev", "VAULT_ADDR=https://vault.example.com"); got != "tok" {
 		t.Errorf("same address: %q", got)
 	}
-	if got := helper("get", "", "VCTX_CONTEXT=dev", "VAULT_ADDR=https://evil.example.com"); got != "" {
-		t.Errorf("token handed to another address: %q", got)
+	out.Reset()
+	a.environ = append(slices.Clip(base), "VCTX_CONTEXT=dev", "VAULT_ADDR=https://evil.example.com")
+	if err := a.run([]string{"get"}); err == nil || out.Len() > 0 {
+		t.Errorf("token handed to another address: err %v, out %q", err, out)
+	}
+
+	// An empty token written by an earlier version must not come back as the address.
+	if err := os.WriteFile(a.tokenPath("stale"), []byte("https://vault.example.com\n\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := helper("get", "", "VCTX_CONTEXT=stale", "VAULT_ADDR=https://vault.example.com"); got != "" {
+		t.Errorf("address returned as token: %q", got)
+	}
+
+	helper("store", "\n", "VCTX_CONTEXT=dev", "VAULT_ADDR=https://vault.example.com")
+	if got := helper("get", "", "VCTX_CONTEXT=dev", "VAULT_ADDR=https://vault.example.com"); got != "" {
+		t.Errorf("empty store left %q", got)
 	}
 
 	if err := os.WriteFile(a.tokenPath("prod"), []byte("legacy\n"), 0o600); err != nil {
@@ -278,17 +302,6 @@ func TestContextNameRejectsPaths(t *testing.T) {
 	}
 	if _, err := os.Stat(victim); err != nil {
 		t.Errorf("file outside the token directory was touched: %v", err)
-	}
-}
-
-func TestIsTerminalDevNull(t *testing.T) {
-	f, err := os.Open(os.DevNull)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer f.Close()
-	if isTerminal(f) {
-		t.Error("/dev/null detected as a terminal")
 	}
 }
 
@@ -328,5 +341,95 @@ func TestPrivatePaths(t *testing.T) {
 	}
 	if err := a.run([]string{"dev", "status"}); err == nil || !strings.Contains(err.Error(), "writable by group or others") {
 		t.Errorf("world-writable state dir: %v", err)
+	}
+}
+
+func TestAddrKeysNeverCollide(t *testing.T) {
+	a, _, _ := newTestApp(t, "VAULT_ADDR=https://vault.example.com")
+	if key := a.tokenKey(); nameRe.MatchString(strings.SplitN(key, "/", 2)[0]) {
+		t.Errorf("address key %q can collide with a context name", key)
+	}
+}
+
+func TestCallerAddrPrefersAgent(t *testing.T) {
+	a, _, _ := newTestApp(t, "VAULT_ADDR=https://vault:8200/", "VAULT_AGENT_ADDR=http://127.0.0.1:8100/")
+	if got := a.callerAddr(); got != "http://127.0.0.1:8100" {
+		t.Errorf("callerAddr = %q", got)
+	}
+}
+
+func TestSplitExec(t *testing.T) {
+	tests := []struct {
+		args     []string
+		name     string
+		wantArgv []string
+	}{
+		{[]string{"--", "vault", "status"}, "", []string{"vault", "status"}},
+		{[]string{"prod", "--", "vault"}, "prod", []string{"vault"}},
+		{[]string{"prod", "vault"}, "prod", []string{"vault"}},
+		{nil, "", nil},
+	}
+	for _, tc := range tests {
+		name, argv := splitExec(tc.args)
+		if name != tc.name || !slices.Equal(argv, tc.wantArgv) {
+			t.Errorf("%q: got %q %q", tc.args, name, argv)
+		}
+	}
+}
+
+func TestUsageErrors(t *testing.T) {
+	a, _, _ := newTestApp(t)
+	var usage usageError
+	for _, args := range [][]string{{"exec"}, {"use", "a", "b"}, {"env", "a", "b"}, {"logout", "a", "b"}} {
+		if err := a.run(args); !errors.As(err, &usage) {
+			t.Errorf("%q: err = %v, want a usage error", args, err)
+		}
+	}
+}
+
+func TestLookPathUsesContextPath(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "vault")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := lookPath("vault", []string{"PATH=relative:" + dir}); err != nil || got != bin {
+		t.Errorf("got %q, %v", got, err)
+	}
+	if _, err := lookPath("vault", []string{"PATH=relative"}); err == nil {
+		t.Error("relative PATH entry used")
+	}
+}
+
+func TestCheckPrivateOwner(t *testing.T) {
+	fi := fakeInfo{mode: 0o600, sys: &syscall.Stat_t{Uid: uint32(os.Getuid() + 1)}}
+	if err := checkPrivate("cfg", fi); err == nil || !strings.Contains(err.Error(), "another user") {
+		t.Errorf("err = %v", err)
+	}
+}
+
+type fakeInfo struct {
+	mode os.FileMode
+	sys  any
+}
+
+func (f fakeInfo) Name() string       { return "f" }
+func (f fakeInfo) Size() int64        { return 0 }
+func (f fakeInfo) Mode() os.FileMode  { return f.mode }
+func (f fakeInfo) ModTime() time.Time { return time.Time{} }
+func (f fakeInfo) IsDir() bool        { return false }
+func (f fakeInfo) Sys() any           { return f.sys }
+
+func TestListShowsDefaults(t *testing.T) {
+	a, out, _ := newTestApp(t)
+	cfg := "defaults:\n  VAULT_NAMESPACE: shared\ncontexts:\n  dev:\n    VAULT_ADDR: http://v\n"
+	if err := os.WriteFile(a.configPath, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.run([]string{"ls"}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "shared") {
+		t.Errorf("namespace from defaults missing:\n%s", out)
 	}
 }

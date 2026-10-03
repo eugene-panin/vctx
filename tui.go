@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"net/url"
 	"os/exec"
 	"slices"
 	"strings"
@@ -40,8 +41,9 @@ var keys = keyMap{
 
 type row struct {
 	name    string
-	vars    map[string]string
-	env     []string
+	vars    map[string]string // as configured, defaults included
+	ctxVars map[string]string // vars plus vctx bookkeeping, for commands run from the UI
+	env     []string          // environment for probing
 	status  contextStatus
 	probing bool
 	gen     int // bumped per probe so a late answer from an older one is ignored
@@ -56,6 +58,16 @@ type probeMsg struct {
 type execDoneMsg struct {
 	i    int
 	what string
+	err  error
+}
+
+type tokensMsg struct {
+	tokens map[string]bool
+	err    error
+}
+
+type forgetMsg struct {
+	name string
 	err  error
 }
 
@@ -75,7 +87,8 @@ type model struct {
 	flash   string
 	flashOK bool
 	chosen  string
-	tokens  map[string]bool // cached: with the keychain every lookup is a process
+	// Loaded in the background: with the keychain every lookup runs a process.
+	tokens map[string]bool
 }
 
 func newModel(a *app, cfg *config) (*model, error) {
@@ -93,41 +106,38 @@ func newModel(a *app, cfg *config) (*model, error) {
 		spin:    spinner.New(spinner.WithSpinner(spinner.MiniDot)),
 		help:    help.New(),
 		p:       newPalette(a.stdout),
+		tokens:  map[string]bool{},
 	}
 	m.spin.Style = m.p.accent
 	m.current, _ = a.contextName("")
 	for _, name := range slices.Sorted(maps.Keys(cfg.Contexts)) {
-		vars, err := a.contextVars(cfg, name)
+		vars, err := cfg.vars(name, a.home)
 		if err != nil {
 			return nil, err
 		}
-		env := applyEnv(a.environ, vars)
+		ctxVars, err := a.contextVars(cfg, name)
+		if err != nil {
+			return nil, err
+		}
+		env := applyEnv(a.environ, ctxVars)
 		t, _ := targetFor(env)
 		if name == m.current {
 			m.cursor = len(m.rows)
 		}
 		m.rows = append(m.rows, row{
 			name:    name,
-			vars:    cfg.Contexts[name],
+			vars:    vars,
+			ctxVars: ctxVars,
 			env:     env,
 			status:  contextStatus{name: name, target: t.String(), display: t.display()},
 			probing: true,
 		})
 	}
-	m.refreshTokens()
 	return m, nil
 }
 
-func (m *model) refreshTokens() {
-	names := make([]string, len(m.rows))
-	for i, r := range m.rows {
-		names[i] = r.name
-	}
-	m.tokens = m.a.tokenStatus(names)
-}
-
 func (m *model) Init() tea.Cmd {
-	cmds := []tea.Cmd{m.spin.Tick}
+	cmds := []tea.Cmd{m.spin.Tick, m.loadTokens()}
 	for i := range m.rows {
 		cmds = append(cmds, m.probe(i))
 	}
@@ -143,103 +153,189 @@ func (m *model) probe(i int) tea.Cmd {
 	}
 }
 
+func (m *model) loadTokens() tea.Cmd {
+	names := make([]string, len(m.rows))
+	for i, r := range m.rows {
+		names[i] = r.name
+	}
+	a := m.a
+	return func() tea.Msg {
+		tokens, err := a.tokenStatus(names)
+		return tokensMsg{tokens: tokens, err: err}
+	}
+}
+
+func (m *model) forget(name string) tea.Cmd {
+	a := m.a
+	return func() tea.Msg {
+		store, err := a.tokens()
+		if err == nil {
+			err = store.del(name)
+		}
+		return forgetMsg{name: name, err: err}
+	}
+}
+
 func (m *model) probing() bool {
 	return slices.ContainsFunc(m.rows, func(r row) bool { return r.probing })
 }
 
+func (m *model) setFlash(msg string, ok bool) {
+	m.flash, m.flashOK = msg, ok
+}
+
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	cmd := m.update(msg)
+	m.scroll()
+	return m, cmd
+}
+
+func (m *model) update(msg tea.Msg) tea.Cmd {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.help.Width = msg.Width
 	case spinner.TickMsg:
 		if !m.probing() {
-			return m, nil
+			return nil
 		}
 		var cmd tea.Cmd
 		m.spin, cmd = m.spin.Update(msg)
-		return m, cmd
+		return cmd
 	case probeMsg:
 		if r := &m.rows[msg.i]; msg.gen == r.gen {
 			r.probing = false
 			r.status.probeResult = msg.res
 		}
-	case execDoneMsg:
-		m.flashOK = msg.err == nil
-		m.flash = msg.what + " finished"
+	case tokensMsg:
+		m.tokens = msg.tokens
 		if msg.err != nil {
-			m.flash = fmt.Sprintf("%s: %v", msg.what, msg.err)
+			m.setFlash("token status: "+msg.err.Error(), false)
 		}
-		m.refreshTokens()
-		return m, tea.Batch(m.spin.Tick, m.probe(msg.i))
+	case forgetMsg:
+		if msg.err != nil {
+			m.setFlash(msg.err.Error(), false)
+		} else {
+			m.setFlash(msg.name+": token forgotten", true)
+		}
+		return m.loadTokens()
+	case execDoneMsg:
+		if msg.err != nil {
+			m.setFlash(fmt.Sprintf("%s: %v", msg.what, msg.err), false)
+		} else {
+			m.setFlash(msg.what+" finished", true)
+		}
+		return tea.Batch(m.spin.Tick, m.probe(msg.i), m.loadTokens())
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 	}
-	return m, nil
+	return nil
 }
 
-func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
+	if key.Matches(msg, keys.Quit) {
+		return tea.Quit
+	}
 	if len(m.rows) == 0 {
-		if key.Matches(msg, keys.Quit) {
-			return m, tea.Quit
-		}
-		return m, nil
+		return nil
 	}
 	r := &m.rows[m.cursor]
 	switch {
-	case key.Matches(msg, keys.Quit):
-		return m, tea.Quit
 	case key.Matches(msg, keys.Up):
 		m.cursor = max(m.cursor-1, 0)
 	case key.Matches(msg, keys.Down):
 		m.cursor = min(m.cursor+1, len(m.rows)-1)
 	case key.Matches(msg, keys.Use):
 		if err := m.a.use(m.cfg, r.name); err != nil {
-			m.flash, m.flashOK = err.Error(), false
-			return m, nil
+			m.setFlash(err.Error(), false)
+			return nil
 		}
 		m.chosen = r.name
-		return m, tea.Quit
+		return tea.Quit
 	case key.Matches(msg, keys.Refresh):
-		cmds := []tea.Cmd{m.spin.Tick}
+		cmds := []tea.Cmd{m.spin.Tick, m.loadTokens()}
 		for i := range m.rows {
 			cmds = append(cmds, m.probe(i))
 		}
 		m.flash = ""
-		return m, tea.Batch(cmds...)
+		return tea.Batch(cmds...)
 	case key.Matches(msg, keys.Login):
-		return m, m.run(m.cursor, "login", m.a.vaultBin(), "login")
+		return m.run(m.cursor, "login", m.a.vaultBin(), "login")
 	case key.Matches(msg, keys.Shell):
 		sh := m.a.getenv("SHELL")
 		if sh == "" {
 			sh = "/bin/sh"
 		}
-		return m, m.run(m.cursor, "shell", sh)
+		return m.run(m.cursor, "shell", sh)
 	case key.Matches(msg, keys.Logout):
-		store, err := m.a.tokens()
-		if err == nil && m.tokens[r.name] {
-			err = store.del(r.name)
+		if !m.tokens[r.name] {
+			m.setFlash(r.name+": no stored token", false)
+			return nil
 		}
-		switch {
-		case err != nil:
-			m.flash, m.flashOK = err.Error(), false
-		case !m.tokens[r.name]:
-			m.flash, m.flashOK = r.name+": no stored token", false
-		default:
-			m.flash, m.flashOK = r.name+": token forgotten", true
-		}
-		m.refreshTokens()
+		return m.forget(r.name)
 	}
-	return m, nil
+	return nil
 }
 
-// run suspends the UI and runs a command in the terminal with the context's environment.
+// run suspends the UI and runs a command in the terminal with the context's
+// environment, vctx registered as the token helper.
 func (m *model) run(i int, what, name string, args ...string) tea.Cmd {
-	cmd := exec.Command(name, args...)
-	cmd.Env = m.rows[i].env
+	vars := maps.Clone(m.rows[i].ctxVars)
+	if err := m.a.registerHelper(vars); err != nil {
+		m.setFlash(err.Error(), false)
+		return nil
+	}
+	env := applyEnv(m.a.environ, vars)
+	bin, err := lookPath(name, env)
+	if err != nil {
+		m.setFlash(err.Error(), false)
+		return nil
+	}
+	cmd := exec.Command(bin, args...)
+	cmd.Env = env
+	label := m.rows[i].name + " " + what
 	return tea.ExecProcess(cmd, func(err error) tea.Msg {
-		return execDoneMsg{i: i, what: m.rows[i].name + " " + what, err: err}
+		return execDoneMsg{i: i, what: label, err: err}
 	})
+}
+
+type layout struct {
+	wide           bool // table and details side by side
+	detail         bool // details under the table
+	tableW, tableH int
+	detailW        int
+}
+
+func (m *model) layout() layout {
+	// One line of header, a blank line after it and one before the footer.
+	bodyH := max(m.height-1-lipgloss.Height(m.footerView())-2, 1)
+	switch {
+	case len(m.rows) == 0:
+		return layout{tableW: m.width, tableH: bodyH}
+	case m.width >= 110 && bodyH >= 5:
+		detailW := min(max(m.width*2/5, 40), 64)
+		return layout{wide: true, tableW: m.width - detailW - 2, tableH: bodyH, detailW: detailW}
+	}
+	l := layout{tableW: m.width, tableH: bodyH}
+	if tableH := bodyH - lipgloss.Height(m.detailView(m.width, 0)) - 1; tableH >= min(len(m.rows)+1, 4) {
+		l.tableH, l.detail = tableH, true
+	}
+	return l
+}
+
+// scroll keeps the cursor row inside the visible part of the table.
+func (m *model) scroll() {
+	if m.width == 0 || len(m.rows) == 0 {
+		return
+	}
+	visible := max(m.layout().tableH-1, 1)
+	if m.cursor < m.offset {
+		m.offset = m.cursor
+	}
+	if m.cursor >= m.offset+visible {
+		m.offset = m.cursor - visible + 1
+	}
+	m.offset = min(m.offset, max(len(m.rows)-visible, 0))
 }
 
 func (m *model) View() string {
@@ -248,25 +344,19 @@ func (m *model) View() string {
 	}
 	header := m.headerView()
 	footer := m.footerView()
-	bodyH := max(m.height-lipgloss.Height(header)-lipgloss.Height(footer)-2, 1)
+	l := m.layout()
 
 	var body string
 	switch {
 	case len(m.rows) == 0:
 		body = m.p.dim.Render("no contexts in " + m.a.configPath)
-	case m.width >= 110 && bodyH >= 5:
-		detailW := min(max(m.width*2/5, 40), 64)
-		tableW := m.width - detailW - 2
+	case l.wide:
 		body = lipgloss.JoinHorizontal(lipgloss.Top,
-			m.tableView(tableW, bodyH), "  ", m.detailView(detailW, bodyH))
+			m.tableView(l.tableW, l.tableH), "  ", m.detailView(l.detailW, l.tableH))
+	case l.detail:
+		body = m.tableView(l.tableW, l.tableH) + "\n\n" + m.detailView(m.width, 0)
 	default:
-		detail := m.detailView(m.width, 0)
-		tableH := bodyH - lipgloss.Height(detail) - 1
-		if tableH >= min(len(m.rows)+1, 4) {
-			body = m.tableView(m.width, tableH) + "\n\n" + detail
-		} else {
-			body = m.tableView(m.width, bodyH)
-		}
+		body = m.tableView(l.tableW, l.tableH)
 	}
 	// Pin the key help to the bottom of the screen.
 	gap := max(m.height-lipgloss.Height(header)-lipgloss.Height(body)-lipgloss.Height(footer)-1, 1)
@@ -318,15 +408,7 @@ func (m *model) tableView(width, height int) string {
 	}
 	const gutter = 2
 	widths := fitColumns(cols, width-gutter, 2)
-
 	visible := max(height-1, 1)
-	if m.cursor < m.offset {
-		m.offset = m.cursor
-	}
-	if m.cursor >= m.offset+visible {
-		m.offset = m.cursor - visible + 1
-	}
-	m.offset = min(m.offset, max(len(m.rows)-visible, 0))
 
 	line := func(gut string, value func(c int) string, style func(c int) lipgloss.Style) string {
 		var parts []string
@@ -372,6 +454,19 @@ func (m *model) tableView(width, height int) string {
 	return strings.Join(lines, "\n")
 }
 
+// displayValue hides secrets in a variable shown on screen: values of
+// token, secret and password variables, and credentials inside URLs.
+func displayValue(key, value string) string {
+	k := strings.ToUpper(key)
+	if strings.Contains(k, "TOKEN") || strings.Contains(k, "SECRET") || strings.Contains(k, "PASSWORD") {
+		return "•••"
+	}
+	if u, err := url.Parse(value); err == nil && u.User != nil {
+		return u.Redacted()
+	}
+	return value
+}
+
 // detailView renders the selected context, cut to height lines unless height is 0.
 func (m *model) detailView(width, height int) string {
 	r := m.rows[m.cursor]
@@ -387,9 +482,13 @@ func (m *model) detailView(width, height int) string {
 		return lipgloss.NewStyle().Width(max(inner-indent, 10)).Render(s)
 	}
 
+	addrKey := "VAULT_ADDR"
+	if r.vars["VAULT_AGENT_ADDR"] != "" {
+		addrKey = "VAULT_AGENT_ADDR"
+	}
 	var b strings.Builder
 	b.WriteString(m.p.accent.Render(r.name) + "\n")
-	b.WriteString(m.p.dim.Render(truncate(r.vars["VAULT_ADDR"], inner)) + "\n\n")
+	b.WriteString(m.p.dim.Render(truncate(displayValue(addrKey, r.vars[addrKey]), inner)) + "\n\n")
 
 	switch text, lvl := r.status.shortSummary(); {
 	case r.probing:
@@ -410,14 +509,9 @@ func (m *model) detailView(width, height int) string {
 
 	var extra []string
 	for _, k := range slices.Sorted(maps.Keys(r.vars)) {
-		if k == "VAULT_ADDR" {
-			continue
+		if k != addrKey {
+			extra = append(extra, truncate(k+"="+displayValue(k, r.vars[k]), inner-8))
 		}
-		v := r.vars[k]
-		if k == "VAULT_TOKEN" {
-			v = "•••"
-		}
-		extra = append(extra, truncate(k+"="+v, inner-8))
 	}
 	if len(extra) > 0 {
 		b.WriteString(label("vars") + strings.Join(extra, "\n"+strings.Repeat(" ", 8)) + "\n")
@@ -456,7 +550,7 @@ func indentLines(s string, n int) string {
 
 // ui runs the full-screen interface; picking a context with enter makes it the default.
 func (a *app) ui() error {
-	if !isTerminal(a.stdin) || !isTerminal(a.stdout) {
+	if !a.stdinTTY || !a.stdoutTTY {
 		return errors.New("the interactive UI needs a terminal, see 'vctx help'")
 	}
 	cfg, err := a.loadConfig()

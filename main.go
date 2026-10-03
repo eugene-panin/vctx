@@ -9,7 +9,6 @@ import (
 	"io/fs"
 	"maps"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -57,8 +56,10 @@ address or token of one instance never leaks into another.
 Tokens from 'vault login' are stored per context and bound to the address
 they were issued for: in the macOS Keychain by default, in files under
 $VCTX_STATE_DIR/tokens (default ~/.local/state/vctx) elsewhere; set
-VCTX_TOKEN_STORE=file or keychain to choose. vctx sets VAULT_CONFIG_PATH to a
-generated config that registers vctx itself as the Vault token helper.
+VCTX_TOKEN_STORE=file or keychain to choose. The Keychain keeps tokens off disk
+and out of backups, but like a 0600 file it does not hide them from other
+programs running as you. vctx sets VAULT_CONFIG_PATH to a generated config
+that registers vctx itself as the Vault token helper.
 
 The config and the state directory must not be writable by other users.
 `
@@ -72,22 +73,31 @@ type app struct {
 	stdin      io.Reader
 	stdout     io.Writer
 	stderr     io.Writer
-	exec       func(argv0 string, argv, envv []string) error
-	keyring    secretService // nil means the system keychain
+	// Whether stdin, stdout and stderr are terminals; tests leave them false.
+	stdinTTY, stdoutTTY, stderrTTY bool
+	exec                           func(argv0 string, argv, envv []string) error
+	keyring                        secretService // nil means the system keychain
 }
+
+// usageError is a malformed command line; it exits with status 2.
+type usageError string
+
+func (e usageError) Error() string { return "usage: " + string(e) }
 
 func main() {
 	a, err := newApp()
 	if err == nil {
 		err = a.run(os.Args[1:])
 	}
+	var usage usageError
 	switch {
-	case errors.Is(err, errAborted):
-		os.Exit(130)
+	case err == nil:
 	case errors.Is(err, errSilent):
 		os.Exit(1)
-	}
-	if err != nil {
+	case errors.As(err, &usage):
+		fmt.Fprintln(os.Stderr, "vctx:", err)
+		os.Exit(2)
+	default:
 		fmt.Fprintln(os.Stderr, "vctx:", err)
 		os.Exit(1)
 	}
@@ -106,13 +116,16 @@ func newApp() (*app, error) {
 		self = p
 	}
 	a := &app{
-		home:    home,
-		self:    self,
-		environ: os.Environ(),
-		stdin:   os.Stdin,
-		stdout:  os.Stdout,
-		stderr:  os.Stderr,
-		exec:    syscall.Exec,
+		home:      home,
+		self:      self,
+		environ:   os.Environ(),
+		stdin:     os.Stdin,
+		stdout:    os.Stdout,
+		stderr:    os.Stderr,
+		stdinTTY:  isTerminal(os.Stdin),
+		stdoutTTY: isTerminal(os.Stdout),
+		stderrTTY: isTerminal(os.Stderr),
+		exec:      syscall.Exec,
 	}
 	a.configPath = a.getenv("VCTX_CONFIG")
 	if a.configPath == "" {
@@ -141,7 +154,7 @@ func (a *app) run(args []string) error {
 		return a.tokenHelper(args[0])
 	}
 	if len(args) == 0 {
-		if isTerminal(a.stdin) && isTerminal(a.stdout) {
+		if a.stdinTTY && a.stdoutTTY {
 			return a.ui()
 		}
 		fmt.Fprint(a.stdout, usage)
@@ -158,7 +171,7 @@ func (a *app) run(args []string) error {
 		return a.list()
 	case "use":
 		if len(rest) > 1 {
-			return errors.New("usage: vctx use [<context>]")
+			return usageError("vctx use [<context>]")
 		}
 		if len(rest) == 0 {
 			return a.ui()
@@ -185,7 +198,7 @@ func (a *app) run(args []string) error {
 		return a.check(rest)
 	case "logout":
 		if len(rest) > 1 {
-			return errors.New("usage: vctx logout [<context>]")
+			return usageError("vctx logout [<context>]")
 		}
 		var arg string
 		if len(rest) == 1 {
@@ -210,7 +223,7 @@ func (a *app) run(args []string) error {
 	case "exec":
 		name, argv := splitExec(rest)
 		if len(argv) == 0 {
-			return errors.New("usage: vctx exec [<context>] -- command [args...]")
+			return usageError("vctx exec [<context>] -- command [args...]")
 		}
 		return a.execIn(name, argv)
 	default:
@@ -285,10 +298,16 @@ func (a *app) list() error {
 	}
 	current, _ := a.contextName("")
 	names := slices.Sorted(maps.Keys(cfg.Contexts))
-	tokens := a.tokenStatus(names)
+	tokens, err := a.tokenStatus(names)
+	if err != nil {
+		fmt.Fprintln(a.stderr, "vctx: token status:", err)
+	}
 	tw := tabwriter.NewWriter(a.stdout, 0, 4, 2, ' ', 0)
 	for _, name := range names {
-		vars := cfg.Contexts[name]
+		vars, err := cfg.vars(name, a.home)
+		if err != nil {
+			return err
+		}
 		mark := " "
 		if name == current {
 			mark = "*"
@@ -301,7 +320,7 @@ func (a *app) list() error {
 		if ns == "" {
 			ns = "-"
 		}
-		fmt.Fprintf(tw, "%s %s\t%s\t%s\t%s\n", mark, name, vars["VAULT_ADDR"], ns, token)
+		fmt.Fprintf(tw, "%s %s\t%s\t%s\t%s\n", mark, name, vaultAddr(vars), ns, token)
 	}
 	return tw.Flush()
 }
@@ -330,7 +349,7 @@ func (a *app) env(args []string) error {
 		return nil
 	}
 	if len(args) > 1 {
-		return errors.New("usage: vctx env [<context> | --clear]")
+		return usageError("vctx env [<context> | --clear]")
 	}
 	var arg string
 	if len(args) == 1 {
@@ -346,6 +365,9 @@ func (a *app) env(args []string) error {
 	}
 	vars, err := a.contextVars(cfg, name)
 	if err != nil {
+		return err
+	}
+	if err := a.registerHelper(vars); err != nil {
 		return err
 	}
 	writeShellEnv(a.stdout, a.environ, vars)
@@ -369,11 +391,14 @@ func (a *app) execWith(cfg *config, name string, argv []string) error {
 	if err != nil {
 		return err
 	}
-	bin, err := exec.LookPath(argv[0])
-	if err != nil {
+	if err := a.registerHelper(vars); err != nil {
 		return err
 	}
 	env := applyEnv(a.environ, vars)
+	bin, err := lookPath(argv[0], env)
+	if err != nil {
+		return err
+	}
 	if err := a.ensureReachable(name, env); err != nil {
 		return err
 	}

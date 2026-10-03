@@ -6,7 +6,9 @@ import (
 	"io/fs"
 	"maps"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 )
@@ -17,6 +19,19 @@ const (
 	// so switching away from it in a shell can unset them.
 	envManaged = "VCTX_VARS"
 )
+
+// Older Vault versions run the token helper through "$SHELL -c '<path> <op>'",
+// newer ones exec it directly; a path of these characters is safe either way.
+var helperPathRe = regexp.MustCompile(`^[A-Za-z0-9/._+-]+$`)
+
+func lookupEnv(env []string, key string) string {
+	for _, kv := range slices.Backward(env) {
+		if k, v, _ := strings.Cut(kv, "="); k == key {
+			return v
+		}
+	}
+	return ""
+}
 
 // contextVars returns every variable to set for context name, including vctx's own bookkeeping.
 func (a *app) contextVars(cfg *config, name string) (map[string]string, error) {
@@ -35,14 +50,20 @@ func (a *app) contextVars(cfg *config, name string) (map[string]string, error) {
 		vars[envManaged] = strings.Join(extra, " ")
 	}
 	vars[envContext] = name
-	if _, ok := vars["VAULT_CONFIG_PATH"]; !ok {
-		p, err := a.writeVaultConfig()
-		if err != nil {
-			return nil, err
-		}
-		vars["VAULT_CONFIG_PATH"] = p
-	}
 	return vars, nil
+}
+
+// registerHelper points vault at vctx as its token helper, unless the context brings its own Vault config.
+func (a *app) registerHelper(vars map[string]string) error {
+	if _, ok := vars["VAULT_CONFIG_PATH"]; ok {
+		return nil
+	}
+	p, err := a.writeVaultConfig()
+	if err != nil {
+		return err
+	}
+	vars["VAULT_CONFIG_PATH"] = p
+	return nil
 }
 
 // managedKeys returns the keys of environ that belong to whatever context was applied before.
@@ -94,16 +115,37 @@ func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
+// lookPath is exec.LookPath against the PATH the command will run with, which
+// the context may set. Relative PATH entries are skipped, as exec.LookPath does.
+func lookPath(file string, env []string) (string, error) {
+	if strings.Contains(file, "/") {
+		return exec.LookPath(file)
+	}
+	for _, dir := range filepath.SplitList(lookupEnv(env, "PATH")) {
+		if !filepath.IsAbs(dir) {
+			continue
+		}
+		p := filepath.Join(dir, file)
+		if fi, err := os.Stat(p); err == nil && fi.Mode().IsRegular() && fi.Mode().Perm()&0o111 != 0 {
+			return p, nil
+		}
+	}
+	return "", fmt.Errorf("%s: %w", file, exec.ErrNotFound)
+}
+
 // writeVaultConfig writes a Vault CLI config that uses this binary as the token helper.
 func (a *app) writeVaultConfig() (string, error) {
-	// Vault runs the helper through "sh -c '<path> <op>'".
-	if strings.ContainsAny(a.self, " \t\n'\"\\$`;&|<>()*?[]") {
+	if !helperPathRe.MatchString(a.self) {
 		return "", fmt.Errorf("vctx binary path %q is not usable as a vault token helper, move it to a plain path", a.self)
 	}
 	if err := os.MkdirAll(a.stateDir, 0o700); err != nil {
 		return "", err
 	}
-	if err := checkPrivate(a.stateDir); err != nil {
+	fi, err := os.Stat(a.stateDir)
+	if err != nil {
+		return "", err
+	}
+	if err := checkPrivate(a.stateDir, fi); err != nil {
 		return "", err
 	}
 	path := filepath.Join(a.stateDir, "vault.hcl")

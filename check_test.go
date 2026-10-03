@@ -1,10 +1,10 @@
 package main
 
 import (
+	"crypto/tls"
 	"encoding/pem"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -73,16 +73,10 @@ func serve(t *testing.T, h http.Handler) string {
 	return srv.URL
 }
 
-// closedURL returns a loopback URL with nothing listening on it.
-func closedURL(t *testing.T) string {
-	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := ln.Addr().String()
-	ln.Close()
-	return "http://" + addr
+// closedURL returns a loopback URL nothing listens on: port 1 (tcpmux) is
+// privileged and unused, unlike a freed ephemeral port another test may take.
+func closedURL(*testing.T) string {
+	return "http://127.0.0.1:1"
 }
 
 func writeContexts(t *testing.T, a *app, addrs map[string]string) {
@@ -173,7 +167,7 @@ func TestTLS(t *testing.T) {
 
 	plain := serve(t, vaultHandler(200, activeBody))
 	r := probe(t.Context(), []string{"VAULT_ADDR=" + strings.Replace(plain, "http://", "https://", 1)}, defaultCheckTimeout)
-	if got := reason(r.err); !strings.Contains(got, "does not speak TLS") {
+	if _, got := classify(r.err); !strings.Contains(got, "does not speak TLS") {
 		t.Errorf("https to plain http: %s", got)
 	}
 }
@@ -249,5 +243,48 @@ func TestRedirectReported(t *testing.T) {
 	short, long := classify(r.err)
 	if short != "blocked (HTTP 302)" || !strings.Contains(long, "redirect to sso.example.com") {
 		t.Errorf("short %q, long %q", short, long)
+	}
+}
+
+func TestTLSAlertLeftToVault(t *testing.T) {
+	srv := httptest.NewUnstartedServer(vaultHandler(200, activeBody))
+	srv.TLS = &tls.Config{ClientAuth: tls.RequireAnyClientCert}
+	srv.Config.ErrorLog = log.New(io.Discard, "", 0)
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+
+	env := []string{"VAULT_ADDR=" + srv.URL, "VAULT_SKIP_VERIFY=true"}
+	r := probe(t.Context(), env, defaultCheckTimeout)
+	if !isTLSError(r.err) || networkProblem(r.err) {
+		t.Fatalf("err = %v: tls %v, network %v", r.err, isTLSError(r.err), networkProblem(r.err))
+	}
+	if short, long := classify(r.err); short != "tls error" || strings.Contains(long, "unreachable") {
+		t.Errorf("short %q, long %q", short, long)
+	}
+
+	a, _, call := newTestApp(t, "VCTX_CHECK_TIMEOUT=2s")
+	cfg := "contexts:\n  x:\n    VAULT_ADDR: " + srv.URL + "\n    VAULT_SKIP_VERIFY: \"true\"\n"
+	if err := os.WriteFile(a.configPath, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.run([]string{"x", "status"}); err != nil || call.argv0 == "" {
+		t.Fatalf("vault not started: err = %v", err)
+	}
+}
+
+func TestAgentAddrWins(t *testing.T) {
+	got, err := targetFor([]string{"VAULT_ADDR=https://vault:8200", "VAULT_AGENT_ADDR=http://127.0.0.1:8100"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.String() != "127.0.0.1:8100" {
+		t.Errorf("target = %s", got)
+	}
+}
+
+func TestProxyErrorKept(t *testing.T) {
+	_, err := targetFor([]string{"VAULT_ADDR=https://v", "VAULT_PROXY_ADDR=http://[::1"})
+	if err == nil || !strings.Contains(err.Error(), "missing ']'") {
+		t.Errorf("err = %v", err)
 	}
 }

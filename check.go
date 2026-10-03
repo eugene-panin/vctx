@@ -44,7 +44,7 @@ func targetFor(env []string) (target, error) {
 		return ""
 	}
 
-	raw := get("VAULT_ADDR")
+	raw := get("VAULT_AGENT_ADDR", "VAULT_ADDR")
 	if raw == "" {
 		raw = defaultVaultAddr
 	}
@@ -71,8 +71,11 @@ func targetFor(env []string) (target, error) {
 		}
 		t.proxy, err = cfg.ProxyFunc()(u)
 	}
-	if err != nil || (t.proxy != nil && t.proxy.Host == "") {
-		return target{}, fmt.Errorf("invalid proxy settings for %s", u.Host)
+	if err != nil {
+		return target{}, fmt.Errorf("proxy settings for %s: %w", u.Host, err)
+	}
+	if t.proxy != nil && t.proxy.Host == "" {
+		return target{}, fmt.Errorf("proxy settings for %s: no host in %q", u.Host, t.proxy.Redacted())
 	}
 	return t, nil
 }
@@ -110,15 +113,6 @@ func hostPort(u *url.URL) string {
 		port = "1080"
 	}
 	return net.JoinHostPort(u.Hostname(), port)
-}
-
-func lookupEnv(env []string, key string) string {
-	for _, kv := range slices.Backward(env) {
-		if k, v, _ := strings.Cut(kv, "="); k == key {
-			return v
-		}
-	}
-	return ""
 }
 
 // tlsConfig mirrors the TLS variables the Vault CLI understands.
@@ -293,26 +287,26 @@ func probe(ctx context.Context, env []string, timeout time.Duration) probeResult
 	return probeResult{health: &h, latency: latency}
 }
 
+// isTLSError reports a failed TLS handshake: a certificate the client rejects,
+// or an alert from the server (client certificate required, no common version).
 func isTLSError(err error) bool {
 	var verr *tls.CertificateVerificationError
 	var herr x509.HostnameError
 	var uerr x509.UnknownAuthorityError
 	var cerr x509.CertificateInvalidError
-	return errors.As(err, &verr) || errors.As(err, &herr) || errors.As(err, &uerr) || errors.As(err, &cerr)
+	return errors.As(err, &verr) || errors.As(err, &herr) || errors.As(err, &uerr) || errors.As(err, &cerr) || isTLSAlert(err)
 }
 
-func reason(err error) string {
-	_, long := classify(err)
-	return long
+// isTLSAlert matches how crypto/tls reports an alert received from the peer;
+// the alert type itself is unexported.
+func isTLSAlert(err error) bool {
+	var opErr *net.OpError
+	return errors.As(err, &opErr) && opErr.Op == "remote error"
 }
 
 // classify describes err twice: a compact label for tables and a full explanation.
+// Error text can carry server or certificate data, so it is sanitized.
 func classify(err error) (short, long string) {
-	short, long = describe(err)
-	return short, sanitize(long, 300)
-}
-
-func describe(err error) (short, long string) {
 	var nv *notVaultError
 	var dnsErr *net.DNSError
 	var recErr tls.RecordHeaderError
@@ -325,20 +319,24 @@ func describe(err error) (short, long string) {
 		if errors.As(err, &verr) {
 			err = verr.Err
 		}
-		return "tls error", "tls: " + err.Error()
+		var opErr *net.OpError
+		if errors.As(err, &opErr) && isTLSAlert(err) {
+			err = opErr.Err
+		}
+		return "tls error", "tls: " + sanitize(err.Error(), 300)
 	// net/http reports this case only as text.
 	case errors.As(err, &recErr), strings.Contains(err.Error(), "server gave HTTP response to HTTPS client"):
 		return "not tls", "tls: server does not speak TLS (http:// instead of https://?)"
 	case errors.As(err, &dnsErr):
-		return "no dns", "unreachable: cannot resolve " + dnsErr.Name
+		return "no dns", "unreachable: cannot resolve " + sanitize(dnsErr.Name, 100)
 	case errors.Is(err, context.DeadlineExceeded), errors.As(err, &netErr) && netErr.Timeout():
 		return "timeout", "unreachable: timed out"
 	}
 	var opErr *net.OpError
 	if errors.As(err, &opErr) && opErr.Err != nil {
-		return "unreachable", "unreachable: " + opErr.Err.Error()
+		return "unreachable", "unreachable: " + sanitize(opErr.Err.Error(), 300)
 	}
-	return "error", err.Error()
+	return "error", sanitize(err.Error(), 300)
 }
 
 // checkTimeout reads VCTX_CHECK_TIMEOUT; zero disables the check.
@@ -372,8 +370,9 @@ func (a *app) ensureReachable(name string, env []string) error {
 		return fmt.Errorf("context %s: %w", name, r.err)
 	}
 	t, _ := targetFor(env)
+	_, long := classify(r.err)
 	return fmt.Errorf("context %s: %s %s\n"+
-		"is the VPN/tunnel up? set VCTX_CHECK_TIMEOUT=0 to skip this check", name, t, reason(r.err))
+		"is the VPN/tunnel up? set VCTX_CHECK_TIMEOUT=0 to skip this check", name, t, long)
 }
 
 // networkProblem reports whether err comes from the network path to Vault
@@ -383,6 +382,9 @@ func networkProblem(err error) bool {
 	var opErr *net.OpError
 	var dnsErr *net.DNSError
 	var netErr net.Error
+	if isTLSError(err) {
+		return false
+	}
 	return errors.As(err, &nv) || errors.As(err, &opErr) || errors.As(err, &dnsErr) ||
 		errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &netErr) && netErr.Timeout())
 }
@@ -408,7 +410,8 @@ func (s contextStatus) summary() (string, level) {
 	case s.err == nil && s.health == nil:
 		return "checking", levelWarn
 	case s.err != nil:
-		return reason(s.err), levelFail
+		_, long := classify(s.err)
+		return long, levelFail
 	case s.health.Sealed || !*s.health.Initialized:
 		return s.health.String(), levelWarn
 	}
@@ -475,9 +478,10 @@ func (a *app) check(args []string) error {
 	if err != nil {
 		return err
 	}
-	statuses := a.withSpinner(fmt.Sprintf("checking %d instances", len(names)), run)
+	var statuses []contextStatus
+	a.withSpinner(fmt.Sprintf("checking %d instances", len(names)), func() { statuses = run() })
 
-	if isTerminal(a.stdout) {
+	if a.stdoutTTY {
 		current, _ := a.contextName("")
 		fmt.Fprintln(a.stdout, a.renderStatusTable(statuses, current))
 	} else {
@@ -503,7 +507,7 @@ func (a *app) check(args []string) error {
 	switch {
 	case failed == 0:
 		return nil
-	case isTerminal(a.stdout):
+	case a.stdoutTTY:
 		return errSilent
 	}
 	return fmt.Errorf("%d of %d contexts not usable", failed, len(names))
