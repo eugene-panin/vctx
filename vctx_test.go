@@ -266,7 +266,7 @@ func TestTokenBoundToAddress(t *testing.T) {
 	}
 	out.Reset()
 	a.environ = withEnv(base, "VCTX_CONTEXT=dev", "VAULT_ADDR=https://evil.example.com")
-	if err := a.run([]string{"get"}); err == nil || out.Len() > 0 {
+	if err := a.run([]string{"get"}); err != nil || out.Len() > 0 {
 		t.Errorf("token handed to another address: err %v, out %q", err, out)
 	}
 
@@ -289,7 +289,7 @@ func TestTokenBoundToAddress(t *testing.T) {
 	}
 	out.Reset()
 	a.environ = withEnv(base, "VCTX_CONTEXT=prod", "VAULT_ADDR=https://anything")
-	if err := a.run([]string{"get"}); err == nil || out.Len() > 0 {
+	if err := a.run([]string{"get"}); err != nil || out.Len() > 0 {
 		t.Errorf("unbound token handed out: err %v, out %q", err, out)
 	}
 }
@@ -353,10 +353,51 @@ func TestPrivatePaths(t *testing.T) {
 	}
 }
 
-func TestAddrKeysNeverCollide(t *testing.T) {
-	a, _, _ := newTestApp(t, "VAULT_ADDR=https://vault.example.com")
-	if key := a.tokenKey(); nameRe.MatchString(strings.SplitN(key, "/", 2)[0]) {
-		t.Errorf("address key %q can collide with a context name", key)
+func TestLoginAfterAddressChange(t *testing.T) {
+	a, out, _ := newTestApp(t)
+	base := a.environ
+	helper := func(op, input, addr string) string {
+		t.Helper()
+		out.Reset()
+		a.environ = withEnv(base, "VCTX_CONTEXT=dev", "VAULT_ADDR="+addr)
+		a.stdin = strings.NewReader(input)
+		if err := a.run([]string{op}); err != nil {
+			t.Fatalf("%s at %s: %v", op, addr, err)
+		}
+		return out.String()
+	}
+	helper("store", "old", "https://old.example.com")
+	// vault login asks for the current token before storing the new one.
+	if got := helper("get", "", "https://new.example.com"); got != "" {
+		t.Errorf("old token offered to the new address: %q", got)
+	}
+	helper("store", "new", "https://new.example.com")
+	if got := helper("get", "", "https://new.example.com"); got != "new" {
+		t.Errorf("after login: %q", got)
+	}
+}
+
+func TestAddressAndContextTokensApart(t *testing.T) {
+	a, out, _ := newTestApp(t)
+	base := a.environ
+	run := func(op, input string, env ...string) string {
+		t.Helper()
+		out.Reset()
+		a.environ = withEnv(base, env...)
+		a.stdin = strings.NewReader(input)
+		if err := a.run([]string{op}); err != nil {
+			t.Fatal(err)
+		}
+		return out.String()
+	}
+	addr := "VAULT_ADDR=https://vault.example.com"
+	run("store", "by-address", addr)
+	run("store", "by-context", addr, "VCTX_CONTEXT=addr")
+	if got := run("get", "", addr); got != "by-address" {
+		t.Errorf("address token = %q", got)
+	}
+	if got := run("get", "", addr, "VCTX_CONTEXT=addr"); got != "by-context" {
+		t.Errorf("context token = %q", got)
 	}
 }
 
@@ -388,9 +429,12 @@ func TestSplitExec(t *testing.T) {
 
 func TestUsageErrors(t *testing.T) {
 	a, _, _ := newTestApp(t)
-	var usage usageError
-	for _, args := range [][]string{{"exec"}, {"use", "a", "b"}, {"env", "a", "b"}, {"logout", "a", "b"}} {
-		if err := a.run(args); !errors.As(err, &usage) {
+	var uerr usageError
+	for _, args := range [][]string{
+		{"exec"}, {"use", "a", "b"}, {"env", "a", "b"}, {"logout", "a", "b"},
+		{"env", "--bogus"}, {"nosuchcommand"}, {"use"},
+	} {
+		if err := a.run(args); !errors.As(err, &uerr) {
 			t.Errorf("%q: err = %v, want a usage error", args, err)
 		}
 	}
@@ -486,18 +530,50 @@ func TestConfigSizeLimit(t *testing.T) {
 	}
 }
 
-func TestMoreUsageErrors(t *testing.T) {
-	a, _, _ := newTestApp(t)
-	var usage usageError
-	for _, args := range [][]string{{"env", "--bogus"}, {"nosuchcommand"}, {"use"}} {
-		if err := a.run(args); !errors.As(err, &usage) {
-			t.Errorf("%q: err = %v, want a usage error", args, err)
-		}
-	}
-}
-
 func TestLookupEnvFirstWins(t *testing.T) {
 	if got := lookupEnv([]string{"A=1", "A=2"}, "A"); got != "1" {
 		t.Errorf("got %q", got)
+	}
+}
+
+func TestSwitchRestoresOwnValues(t *testing.T) {
+	cfg := &config{Contexts: map[string]map[string]string{
+		"a": {"VAULT_ADDR": "https://a", "PATH": "/opt/a/bin:/usr/bin", "HTTPS_PROXY": "http://proxy-a"},
+		"b": {"VAULT_ADDR": "https://b"},
+	}}
+	a, _, _ := newTestApp(t)
+	user := []string{"PATH=/usr/bin", "HTTPS_PROXY=http://mine", "HOME=/home/u"}
+	ctx := func(environ []string, name string) []string {
+		t.Helper()
+		a.environ = environ
+		vars, err := a.contextVars(cfg, name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return applyEnv(environ, vars)
+	}
+
+	inA := ctx(user, "a")
+	if lookupEnv(inA, "PATH") != "/opt/a/bin:/usr/bin" || lookupEnv(inA, "VCTX_SAVED_PATH") != "/usr/bin" {
+		t.Errorf("in a: %q", inA)
+	}
+	// Re-applying a must not save a's own value as the user's.
+	if again := ctx(inA, "a"); lookupEnv(again, "VCTX_SAVED_PATH") != "/usr/bin" {
+		t.Errorf("a again: %q", again)
+	}
+	inB := ctx(inA, "b")
+	if lookupEnv(inB, "PATH") != "/usr/bin" || lookupEnv(inB, "HTTPS_PROXY") != "http://mine" {
+		t.Errorf("in b: %q", inB)
+	}
+	for _, kv := range inB {
+		if strings.HasPrefix(kv, "VCTX_SAVED_") {
+			t.Errorf("saved value left behind: %s", kv)
+		}
+	}
+
+	var sh bytes.Buffer
+	writeShellEnv(&sh, inA, nil)
+	if !strings.Contains(sh.String(), "export PATH='/usr/bin'\n") || strings.Contains(sh.String(), "unset PATH") {
+		t.Errorf("--clear from a:\n%s", sh.String())
 	}
 }

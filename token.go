@@ -3,7 +3,6 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"io"
 	"path/filepath"
@@ -49,7 +48,9 @@ func (a *app) callerAddr() string {
 //
 // A stored value holds the address the token was issued for and the token,
 // one per line, so a token is never handed to vault talking to another address.
-// Vault shows the helper's stderr only when it exits non-zero, so a refusal is an error.
+// A token for another address, or one stored without an address, is reported as
+// missing rather than as an error: `vault login` asks for the current token
+// first and would fail, leaving no way to replace it.
 func (a *app) tokenHelper(op string) error {
 	store, err := a.tokens()
 	if err != nil {
@@ -63,13 +64,8 @@ func (a *app) tokenHelper(op string) error {
 			return err
 		}
 		addr, token, bound := strings.Cut(strings.TrimSpace(v), "\n")
-		switch {
-		case !bound && strings.Contains(addr, "://"):
-			return nil // an address with an empty token
-		case !bound:
-			return errors.New("the stored token predates address binding; log in again")
-		case strings.TrimSpace(addr) != a.callerAddr():
-			return fmt.Errorf("the stored token is for %s, not %s; log in again", strings.TrimSpace(addr), a.callerAddr())
+		if !bound || strings.TrimSpace(addr) != a.callerAddr() {
+			return nil
 		}
 		_, err = io.WriteString(a.stdout, strings.TrimSpace(token))
 		return err

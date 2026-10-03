@@ -43,6 +43,16 @@ func TestTargetFor(t *testing.T) {
 	}
 }
 
+// probeEnv probes the target env resolves to, as vctx does before running vault.
+func probeEnv(t *testing.T, env []string) probeResult {
+	t.Helper()
+	tg, err := targetFor(env)
+	if err != nil {
+		return probeResult{err: err}
+	}
+	return probe(t.Context(), tg, env, defaultCheckTimeout)
+}
+
 func vaultHandler(status int, body string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/sys/health" {
@@ -150,13 +160,13 @@ func TestTLS(t *testing.T) {
 	}
 
 	env := []string{"VAULT_ADDR=" + srv.URL}
-	if r := probe(t.Context(), env, defaultCheckTimeout); !isTLSError(r.err) {
+	if r := probeEnv(t, env); !isTLSError(r.err) {
 		t.Errorf("without CA: err = %v, want a TLS verification error", r.err)
 	}
-	if r := probe(t.Context(), append(env, "VAULT_CACERT="+caFile), defaultCheckTimeout); r.err != nil {
+	if r := probeEnv(t, append(env, "VAULT_CACERT="+caFile)); r.err != nil {
 		t.Errorf("with VAULT_CACERT: %v", r.err)
 	}
-	if r := probe(t.Context(), append(env, "VAULT_SKIP_VERIFY=true"), defaultCheckTimeout); r.err != nil {
+	if r := probeEnv(t, append(env, "VAULT_SKIP_VERIFY=true")); r.err != nil {
 		t.Errorf("with VAULT_SKIP_VERIFY: %v", r.err)
 	}
 
@@ -168,7 +178,7 @@ func TestTLS(t *testing.T) {
 	}
 
 	plain := serve(t, vaultHandler(200, activeBody))
-	r := probe(t.Context(), []string{"VAULT_ADDR=" + strings.Replace(plain, "http://", "https://", 1)}, defaultCheckTimeout)
+	r := probeEnv(t, []string{"VAULT_ADDR=" + strings.Replace(plain, "http://", "https://", 1)})
 	if _, got := classify(r.err); !strings.Contains(got, "does not speak TLS") {
 		t.Errorf("https to plain http: %s", got)
 	}
@@ -227,7 +237,7 @@ func TestConfigErrorHasNoVPNHint(t *testing.T) {
 
 func TestServerTextSanitized(t *testing.T) {
 	body := `{"initialized":true,"sealed":false,"version":"1.0\u001b]0;PWNED\u0007\u001b[2J"}`
-	r := probe(t.Context(), []string{"VAULT_ADDR=" + serve(t, vaultHandler(200, body))}, defaultCheckTimeout)
+	r := probeEnv(t, []string{"VAULT_ADDR=" + serve(t, vaultHandler(200, body))})
 	if r.err != nil {
 		t.Fatal(r.err)
 	}
@@ -241,7 +251,7 @@ func TestServerTextSanitized(t *testing.T) {
 
 func TestRedirectReported(t *testing.T) {
 	addr := serve(t, http.RedirectHandler("https://sso.example.com/login", http.StatusFound))
-	r := probe(t.Context(), []string{"VAULT_ADDR=" + addr}, defaultCheckTimeout)
+	r := probeEnv(t, []string{"VAULT_ADDR=" + addr})
 	short, long := classify(r.err)
 	if short != "blocked (HTTP 302)" || !strings.Contains(long, "redirect to sso.example.com") {
 		t.Errorf("short %q, long %q", short, long)
@@ -256,7 +266,7 @@ func TestTLSAlertLeftToVault(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	env := []string{"VAULT_ADDR=" + srv.URL, "VAULT_SKIP_VERIFY=true"}
-	r := probe(t.Context(), env, defaultCheckTimeout)
+	r := probeEnv(t, env)
 	if !isTLSError(r.err) || networkProblem(r.err) {
 		t.Fatalf("err = %v: tls %v, network %v", r.err, isTLSError(r.err), networkProblem(r.err))
 	}
@@ -345,7 +355,7 @@ func TestUnhealthyNodesAreVault(t *testing.T) {
 		{530, `{"initialized":true,"sealed":false,"standby":true,"removed_from_cluster":true,"version":"1.20.4"}`, "1.20.4 removed from cluster", false},
 	} {
 		addr := serve(t, vaultHandler(tc.status, tc.body))
-		r := probe(t.Context(), []string{"VAULT_ADDR=" + addr}, defaultCheckTimeout)
+		r := probeEnv(t, []string{"VAULT_ADDR=" + addr})
 		if r.err != nil || r.health.String() != tc.want || r.health.usable() != tc.usable {
 			t.Errorf("HTTP %d: err %v, health %+v", tc.status, r.err, r.health)
 		}
@@ -363,7 +373,7 @@ func TestInlineCACert(t *testing.T) {
 	srv.StartTLS()
 	t.Cleanup(srv.Close)
 	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw})
-	r := probe(t.Context(), []string{"VAULT_ADDR=" + srv.URL, "VAULT_CACERT_BYTES=" + string(pemBytes)}, defaultCheckTimeout)
+	r := probeEnv(t, []string{"VAULT_ADDR=" + srv.URL, "VAULT_CACERT_BYTES=" + string(pemBytes)})
 	if r.err != nil {
 		t.Errorf("VAULT_CACERT_BYTES: %v", r.err)
 	}
@@ -381,5 +391,49 @@ func TestReachabilityErrorsClassified(t *testing.T) {
 	writeContexts(t, a, map[string]string{"x": "unix://" + filepath.Join(t.TempDir(), "agent.sock")})
 	if err := a.run([]string{"x", "status"}); err == nil || !strings.Contains(err.Error(), "vault agent") {
 		t.Errorf("agent socket: %v", err)
+	}
+}
+
+func TestUnixSocketPaths(t *testing.T) {
+	for raw, want := range map[string]string{
+		"unix:///run/vault.sock": "/run/vault.sock",
+		"unix://v.sock":          "v.sock",
+	} {
+		got, err := targetFor([]string{"VAULT_ADDR=" + raw})
+		if err != nil || got.unix != want {
+			t.Errorf("%s: unix %q, err %v", raw, got.unix, err)
+		}
+	}
+	if _, err := targetFor([]string{"VAULT_ADDR=unix://"}); err == nil {
+		t.Error("empty socket path accepted")
+	}
+}
+
+func TestProxyRefusal(t *testing.T) {
+	proxy := serve(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "denied", http.StatusForbidden)
+	}))
+	r := probeEnv(t, []string{"VAULT_ADDR=https://vault.example.com", "VAULT_PROXY_ADDR=" + proxy})
+	short, long := classify(r.err)
+	if short != "blocked by proxy" || !networkProblem(r.err) || strings.Contains(long, "Get ") {
+		t.Errorf("short %q, long %q, network %v", short, long, networkProblem(r.err))
+	}
+}
+
+func TestProxyCredentialsNotShown(t *testing.T) {
+	for _, env := range [][]string{
+		{"VAULT_ADDR=https://v", "VAULT_PROXY_ADDR=http://user:s3cret@[::1"},
+		{"VAULT_ADDR=https://v", "HTTPS_PROXY=http://user:s3cret@[::1"},
+		{"VAULT_ADDR=https://user:s3cret@[::1"},
+	} {
+		var shown string
+		if tg, err := targetFor(env); err != nil {
+			_, shown = classify(err)
+		} else {
+			shown = tg.String() + " " + tg.display()
+		}
+		if strings.Contains(shown, "s3cret") {
+			t.Errorf("%q: password in %q", env, shown)
+		}
 	}
 }

@@ -15,9 +15,6 @@ import (
 	"github.com/charmbracelet/x/term"
 )
 
-// errSilent ends the program with status 1 but no message: the failure is already on screen.
-var errSilent = errors.New("failed")
-
 func isTerminal(f *os.File) bool {
 	return term.IsTerminal(f.Fd())
 }
@@ -49,6 +46,27 @@ func newPalette(w io.Writer) palette {
 		bold:   r.NewStyle().Bold(true),
 		accent: r.NewStyle().Foreground(lipgloss.Color("5")).Bold(true),
 	}
+}
+
+// column styles a cell of the status table built by statusColumns.
+func (p palette) column(c int, lvl level, selected, probing bool) lipgloss.Style {
+	switch c {
+	case 0:
+		return p.accent
+	case 1:
+		if selected {
+			return p.accent
+		}
+		return p.bold
+	case 2, 4:
+		return p.dim
+	case 3:
+		if probing {
+			return p.dim
+		}
+		return p.level(lvl)
+	}
+	return p.ok
 }
 
 func (p palette) level(l level) lipgloss.Style {
@@ -150,19 +168,7 @@ func (a *app) renderStatusTable(statuses []contextStatus, current string) string
 	}
 	line(-1, func(int) lipgloss.Style { return p.dim })
 	for r := range statuses {
-		line(r, func(c int) lipgloss.Style {
-			switch c {
-			case 0:
-				return p.accent
-			case 1:
-				return p.bold
-			case 2, 4:
-				return p.dim
-			case 3:
-				return p.level(levels[r])
-			}
-			return p.ok
-		})
+		line(r, func(c int) lipgloss.Style { return p.column(c, levels[r], false, false) })
 	}
 
 	var failed, network, agent bool

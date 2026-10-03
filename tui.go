@@ -1,8 +1,6 @@
 package main
 
 import (
-	"context"
-	"errors"
 	"fmt"
 	"maps"
 	"net/url"
@@ -40,11 +38,8 @@ var keys = keyMap{
 }
 
 type row struct {
-	name    string
-	vars    map[string]string // as configured, defaults included
-	ctxVars map[string]string // vars plus vctx bookkeeping, for commands run from the UI
-	env     []string          // environment for probing
-	status  contextStatus
+	name string
+	prepared
 	probing bool
 	gen     int // bumped per probe so a late answer from an older one is ignored
 }
@@ -113,22 +108,14 @@ func newModel(a *app, cfg *config) (*model, error) {
 	m.spin.Style = m.p.accent
 	m.current, _ = a.contextName("")
 	for _, name := range slices.Sorted(maps.Keys(cfg.Contexts)) {
-		vars, err := cfg.vars(name, a.home)
-		if err != nil {
-			return nil, err
-		}
-		ctxVars, err := a.contextVars(cfg, name)
-		if err != nil {
-			return nil, err
-		}
-		status, env, err := a.prepare(cfg, name)
+		p, err := a.prepare(cfg, name)
 		if err != nil {
 			return nil, err
 		}
 		if name == m.current {
 			m.cursor = len(m.rows)
 		}
-		m.rows = append(m.rows, row{name: name, vars: vars, ctxVars: ctxVars, env: env, status: status})
+		m.rows = append(m.rows, row{name: name, prepared: p})
 	}
 	return m, nil
 }
@@ -141,8 +128,7 @@ func (m *model) Init() tea.Cmd {
 func (m *model) refresh() tea.Cmd {
 	cmds := []tea.Cmd{m.spin.Tick, m.loadTokens()}
 	for i := range m.rows {
-		var cfgErr *configError
-		if !errors.As(m.rows[i].status.err, &cfgErr) {
+		if !m.rows[i].badAddr {
 			cmds = append(cmds, m.probe(i))
 		}
 	}
@@ -152,9 +138,9 @@ func (m *model) refresh() tea.Cmd {
 func (m *model) probe(i int) tea.Cmd {
 	m.rows[i].probing = true
 	m.rows[i].gen++
-	env, gen, timeout := m.rows[i].env, m.rows[i].gen, m.timeout
+	p, gen, timeout := m.rows[i].prepared, m.rows[i].gen, m.timeout
 	return func() tea.Msg {
-		return probeMsg{i: i, gen: gen, res: probe(context.Background(), env, timeout)}
+		return probeMsg{i: i, gen: gen, res: p.probe(timeout)}
 	}
 }
 
@@ -283,7 +269,7 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 // run suspends the UI and runs a command in the terminal with the context's
 // environment, vctx registered as the token helper.
 func (m *model) run(i int, what, name string, args ...string) tea.Cmd {
-	vars := maps.Clone(m.rows[i].ctxVars)
+	vars := maps.Clone(m.rows[i].vars)
 	if err := m.a.registerHelper(vars); err != nil {
 		m.setFlash(err.Error(), false)
 		return nil
@@ -429,25 +415,7 @@ func (m *model) tableView(width, height int) string {
 				return m.spin.View() + " checking"
 			}
 			return cols[c].cells[i]
-		}, func(c int) lipgloss.Style {
-			switch c {
-			case 0:
-				return m.p.accent
-			case 1:
-				if selected {
-					return m.p.accent
-				}
-				return m.p.bold
-			case 2, 4:
-				return m.p.dim
-			case 3:
-				if m.rows[i].probing {
-					return m.p.dim
-				}
-				return m.p.level(levels[i])
-			}
-			return m.p.ok
-		}))
+		}, func(c int) lipgloss.Style { return m.p.column(c, levels[i], selected, m.rows[i].probing) }))
 	}
 	return strings.Join(lines, "\n")
 }
@@ -507,7 +475,7 @@ func (m *model) detailView(width, height int) string {
 
 	var extra []string
 	for _, k := range slices.Sorted(maps.Keys(r.vars)) {
-		if k != addrKey {
+		if k != addrKey && !strings.HasPrefix(k, "VCTX_") {
 			extra = append(extra, truncate(k+"="+displayValue(k, r.vars[k]), inner-8))
 		}
 	}

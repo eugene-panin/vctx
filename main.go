@@ -54,7 +54,8 @@ Inherited VAULT_* variables are dropped before a context is applied, so an
 address or token of one instance never leaks into another. vctx refuses vault's
 -address and -agent-address flags: the token helper cannot see them and would
 hand the context's token to that server. In a shell set up with 'vctx env'
-nothing stops them, so do not pass them there.
+nothing stops them, so do not pass them there. Other variables a context sets,
+PATH or HTTPS_PROXY say, get your own values back when you switch away.
 
 Tokens from 'vault login' are stored per context and bound to the address
 they were issued for: in the macOS Keychain by default, in files under
@@ -82,6 +83,9 @@ type app struct {
 	keyring                        secretService // nil means the system keychain
 }
 
+// errSilent ends the program with status 1 but no message: the failure is already on screen.
+var errSilent = errors.New("failed")
+
 // usageError is a malformed command line; it exits with status 2.
 type usageError string
 
@@ -92,12 +96,12 @@ func main() {
 	if err == nil {
 		err = a.run(os.Args[1:])
 	}
-	var usage usageError
+	var uerr usageError
 	switch {
 	case err == nil:
 	case errors.Is(err, errSilent):
 		os.Exit(1)
-	case errors.As(err, &usage):
+	case errors.As(err, &uerr):
 		fmt.Fprintln(os.Stderr, "vctx:", err)
 		os.Exit(2)
 	default:
@@ -115,8 +119,9 @@ func newApp() (*app, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Keep the path as invoked: a package manager's symlink survives upgrades,
-	// the versioned file it points to does not. Resolve only if that path is unusable.
+	// On macOS os.Executable keeps the path as invoked: a package manager's symlink
+	// survives upgrades, the versioned file it points to does not. (Linux reads
+	// /proc/self/exe, already resolved.) Resolve only if the path is unusable.
 	if !helperPathRe.MatchString(self) {
 		if p, err := filepath.EvalSymlinks(self); err == nil {
 			self = p

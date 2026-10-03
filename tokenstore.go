@@ -137,6 +137,9 @@ func (s keychainStore) has(key string) (bool, error) {
 
 func (s keychainStore) set(key, value string) error {
 	if err := s.kr.Set(keyringService, key, value); err != nil {
+		if errors.Is(err, keyring.ErrSetDataTooBig) {
+			return fmt.Errorf("token too long for the keychain, set VCTX_TOKEN_STORE=file to use files: %w", err)
+		}
 		return keychainError(err)
 	}
 	return s.legacy.del(key)

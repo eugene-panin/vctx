@@ -26,12 +26,17 @@ var helperPathRe = regexp.MustCompile(`^[A-Za-z0-9/._+-]+$`)
 
 // lookupEnv returns the first value of key, as getenv(3) and the Go runtime do.
 func lookupEnv(env []string, key string) string {
+	v, _ := lookupEnvOK(env, key)
+	return v
+}
+
+func lookupEnvOK(env []string, key string) (string, bool) {
 	for _, kv := range env {
 		if k, v, _ := strings.Cut(kv, "="); k == key {
-			return v
+			return v, true
 		}
 	}
-	return ""
+	return "", false
 }
 
 // contextVars returns every variable to set for context name, including vctx's own bookkeeping.
@@ -67,34 +72,84 @@ func (a *app) registerHelper(vars map[string]string) error {
 	return nil
 }
 
-// managedKeys returns the keys of environ that belong to whatever context was applied before.
-func managedKeys(environ []string) map[string]bool {
-	keys := make(map[string]bool)
+// envSavedPrefix keeps the user's own value of a non-VAULT variable a context
+// overrides, so switching away from that context puts the value back.
+const envSavedPrefix = "VCTX_SAVED_"
+
+// envPlan turns an inherited environment into the one for a context.
+type envPlan struct {
+	set   map[string]string
+	unset map[string]bool // inherited keys to drop that set does not replace
+}
+
+// planEnv drops whatever the previous context set, restores the user's values
+// it had overridden, and applies vars, saving the values vars overrides now.
+func planEnv(environ []string, vars map[string]string) envPlan {
+	prev := map[string]bool{} // non-VAULT keys the previous context set
+	saved := map[string]string{}
+	drop := map[string]bool{}
 	for _, kv := range environ {
 		k, v, _ := strings.Cut(kv, "=")
-		if strings.HasPrefix(k, "VAULT_") || k == envContext || k == envManaged {
-			keys[k] = true
-		}
-		if k == envManaged {
+		switch {
+		case strings.HasPrefix(k, "VAULT_"), k == envContext:
+			drop[k] = true
+		case k == envManaged:
+			drop[k] = true
 			for _, f := range strings.Fields(v) {
-				keys[f] = true
+				prev[f], drop[f] = true, true
+			}
+		case strings.HasPrefix(k, envSavedPrefix):
+			drop[k] = true
+			if name := strings.TrimPrefix(k, envSavedPrefix); envKeyRe.MatchString(name) {
+				if _, dup := saved[name]; !dup {
+					saved[name] = v
+				}
 			}
 		}
 	}
-	return keys
+
+	set := make(map[string]string, len(vars))
+	maps.Copy(set, vars)
+	for k := range vars {
+		if strings.HasPrefix(k, "VAULT_") || strings.HasPrefix(k, "VCTX_") {
+			continue
+		}
+		orig, had := saved[k]
+		if !prev[k] {
+			orig, had = lookupEnvOK(environ, k)
+		}
+		if had {
+			set[envSavedPrefix+k] = orig
+		}
+	}
+	for k := range prev {
+		if v, ok := saved[k]; ok {
+			if _, replaced := set[k]; !replaced {
+				set[k] = v
+			}
+		}
+	}
+
+	unset := map[string]bool{}
+	for k := range drop {
+		if _, ok := set[k]; !ok {
+			unset[k] = true
+		}
+	}
+	return envPlan{set: set, unset: unset}
 }
 
 func applyEnv(environ []string, vars map[string]string) []string {
-	drop := managedKeys(environ)
-	out := make([]string, 0, len(environ)+len(vars))
+	p := planEnv(environ, vars)
+	out := make([]string, 0, len(environ)+len(p.set))
 	for _, kv := range environ {
 		k, _, _ := strings.Cut(kv, "=")
-		if _, set := vars[k]; !set && !drop[k] {
+		if _, replaced := p.set[k]; !replaced && !p.unset[k] {
 			out = append(out, kv)
 		}
 	}
-	for _, k := range slices.Sorted(maps.Keys(vars)) {
-		out = append(out, k+"="+vars[k])
+	for _, k := range slices.Sorted(maps.Keys(p.set)) {
+		out = append(out, k+"="+p.set[k])
 	}
 	return out
 }
@@ -102,13 +157,14 @@ func applyEnv(environ []string, vars map[string]string) []string {
 // writeShellEnv prints POSIX shell commands that turn environ into the environment applyEnv would build.
 // The output is eval'd, so inherited names that are not plain identifiers are skipped.
 func writeShellEnv(w io.Writer, environ []string, vars map[string]string) {
-	for _, k := range slices.Sorted(maps.Keys(managedKeys(environ))) {
-		if _, ok := vars[k]; !ok && envKeyRe.MatchString(k) {
+	p := planEnv(environ, vars)
+	for _, k := range slices.Sorted(maps.Keys(p.unset)) {
+		if envKeyRe.MatchString(k) {
 			fmt.Fprintf(w, "unset %s\n", k)
 		}
 	}
-	for _, k := range slices.Sorted(maps.Keys(vars)) {
-		fmt.Fprintf(w, "export %s=%s\n", k, shellQuote(vars[k]))
+	for _, k := range slices.Sorted(maps.Keys(p.set)) {
+		fmt.Fprintf(w, "export %s=%s\n", k, shellQuote(p.set[k]))
 	}
 }
 

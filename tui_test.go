@@ -196,3 +196,29 @@ func TestStaleTokenStatusIgnored(t *testing.T) {
 		t.Error("late token status brought a forgotten token back")
 	}
 }
+
+func TestRefreshRetriesConfigErrorsFromProbe(t *testing.T) {
+	a, _, _ := newTestApp(t)
+	cfg := "contexts:\n  x:\n    VAULT_ADDR: https://127.0.0.1:1\n    VAULT_CACERT: /nonexistent/ca.pem\n"
+	if err := os.WriteFile(a.configPath, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := a.loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := newModel(a, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := m.probe(0)
+	m.Update(cmd())
+	if short, _ := m.rows[0].status.shortSummary(); short != "config error" {
+		t.Fatalf("status = %q", short)
+	}
+	gen := m.rows[0].gen
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
+	if m.rows[0].gen == gen {
+		t.Error("refresh skipped a context whose address is fine")
+	}
+}

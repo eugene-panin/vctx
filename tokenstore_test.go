@@ -108,3 +108,16 @@ func TestHasDoesNotMigrate(t *testing.T) {
 		t.Errorf("status check migrated the token: %v", kr)
 	}
 }
+
+type smallKeyring struct{ fakeKeyring }
+
+func (smallKeyring) Set(string, string, string) error { return keyring.ErrSetDataTooBig }
+
+func TestKeychainTokenTooLong(t *testing.T) {
+	a, _, _ := newTestApp(t, "VCTX_TOKEN_STORE=keychain", "VCTX_CONTEXT=dev")
+	a.keyring = smallKeyring{fakeKeyring{}}
+	a.stdin = strings.NewReader(strings.Repeat("t", 4000))
+	if err := a.run([]string{"store"}); err == nil || !strings.Contains(err.Error(), "too long") {
+		t.Errorf("err = %v", err)
+	}
+}
