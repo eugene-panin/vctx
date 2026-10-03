@@ -33,7 +33,7 @@ Usage:
 The context is taken from the explicit name, then $VCTX_CONTEXT,
 then the default set by 'vctx use'.
 
-Config: $VCTX_CONFIG or ~/.config/vctx/config.yaml
+Config: $VCTX_CONFIG or $XDG_CONFIG_HOME/vctx/config.yaml (~/.config by default)
 
   defaults:                  # applied to every context
     VAULT_FORMAT: json
@@ -59,7 +59,7 @@ PATH or HTTPS_PROXY say, get your own values back when you switch away.
 
 Tokens from 'vault login' are stored per context and bound to the address
 they were issued for: in the macOS Keychain by default, in files under
-$VCTX_STATE_DIR/tokens (default ~/.local/state/vctx) elsewhere; set
+$VCTX_STATE_DIR/tokens (default $XDG_STATE_HOME/vctx, ~/.local/state/vctx) elsewhere; set
 VCTX_TOKEN_STORE=file or keychain to choose. The Keychain keeps tokens off disk
 and out of backups, but like a 0600 file it does not hide them from other
 programs running as you. vctx sets VAULT_CONFIG_PATH to a generated config
@@ -193,7 +193,7 @@ func (a *app) run(args []string) error {
 		}
 		return a.list()
 	case "use":
-		if len(rest) > 1 {
+		if len(rest) > 1 || len(rest) == 1 && strings.HasPrefix(rest[0], "-") {
 			return usageError("usage: vctx use [<context>]")
 		}
 		if len(rest) == 0 {
@@ -226,7 +226,7 @@ func (a *app) run(args []string) error {
 		}
 		return a.check(rest)
 	case "logout":
-		if len(rest) > 1 {
+		if len(rest) > 1 || len(rest) == 1 && strings.HasPrefix(rest[0], "-") {
 			return usageError("usage: vctx logout [<context>]")
 		}
 		var arg string
@@ -241,14 +241,17 @@ func (a *app) run(args []string) error {
 		if err != nil {
 			return err
 		}
-		if _, ok := cfg.Contexts[name]; !ok {
-			return fmt.Errorf("unknown context %q", name)
-		}
 		store, err := a.tokens()
 		if err != nil {
 			return err
 		}
-		return a.forgetToken(store, name)
+		// A context renamed or removed from the config may still have a token to forget.
+		if _, ok := cfg.Contexts[name]; !ok {
+			if _, stored, err := store.addr(name); err != nil || !stored {
+				return errors.Join(fmt.Errorf("unknown context %q", name), err)
+			}
+		}
+		return store.del(name)
 	case "exec":
 		name, argv := splitExec(rest)
 		if len(argv) == 0 {

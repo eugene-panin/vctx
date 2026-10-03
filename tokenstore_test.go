@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -11,7 +12,11 @@ import (
 
 type fakeKeyring map[string]string
 
+// getCalls counts secret reads: status must not need them.
+var getCalls int
+
 func (f fakeKeyring) Get(service, user string) (string, error) {
+	getCalls++
 	v, ok := f[service+"/"+user]
 	if !ok {
 		return "", keyring.ErrNotFound
@@ -151,5 +156,80 @@ func TestKeychainTokenTooLong(t *testing.T) {
 	a.stdin = strings.NewReader(strings.Repeat("t", 4000))
 	if err := a.run([]string{"store"}); err == nil || !strings.Contains(err.Error(), "too long") {
 		t.Errorf("err = %v", err)
+	}
+}
+
+func TestKeychainStatusReadsNoSecret(t *testing.T) {
+	a, _, _ := newTestApp(t, "VCTX_TOKEN_STORE=keychain", "VCTX_CONTEXT=dev", "VAULT_ADDR=http://127.0.0.1:8201")
+	kr := fakeKeyring{}
+	a.keyring = kr
+	a.stdin = strings.NewReader("tok")
+	if err := a.run([]string{"store"}); err != nil {
+		t.Fatal(err)
+	}
+	getCalls = 0
+	if got, err := a.tokenStatus(loadTestConfig(t, a), []string{"dev"}); err != nil || got["dev"] != tokenOK {
+		t.Fatalf("status = %v, %v", got, err)
+	}
+	if getCalls != 0 {
+		t.Errorf("status read the secret %d times", getCalls)
+	}
+	if err := a.run([]string{"erase"}); err != nil {
+		t.Fatal(err)
+	}
+	if entries, _ := os.ReadDir(filepath.Join(a.stateDir, "keychain-addrs")); len(entries) != 0 {
+		t.Errorf("address records left after erase: %v", entries)
+	}
+}
+
+// The file and keychain stores keep their own addresses, so switching
+// VCTX_TOKEN_STORE never pairs one store's token with the other's address.
+func TestStoresKeepTheirOwnAddresses(t *testing.T) {
+	a, out, _ := newTestApp(t, "VCTX_CONTEXT=dev")
+	kr := fakeKeyring{}
+	a.keyring = kr
+	base := a.environ
+	run := func(op, input string, env ...string) string {
+		t.Helper()
+		out.Reset()
+		a.environ = withEnv(base, env...)
+		a.stdin = strings.NewReader(input)
+		if err := a.run([]string{op}); err != nil {
+			t.Fatal(err)
+		}
+		return out.String()
+	}
+	run("store", "kc-token", "VCTX_TOKEN_STORE=keychain", "VAULT_ADDR=http://127.0.0.1:8201")
+	run("store", "file-token", "VCTX_TOKEN_STORE=file", "VAULT_ADDR=http://other:8201")
+
+	a.environ = withEnv(base, "VCTX_TOKEN_STORE=keychain")
+	state, _ := a.tokenStatus(loadTestConfig(t, a), []string{"dev"})
+	got := run("get", "", "VCTX_TOKEN_STORE=keychain", "VAULT_ADDR=http://127.0.0.1:8201")
+	if state["dev"] != tokenOK || got != "kc-token" {
+		t.Errorf("keychain: status %v, get %q", state["dev"], got)
+	}
+}
+
+type refusingKeyring struct{ fakeKeyring }
+
+func (refusingKeyring) Set(string, string, string) error { return errors.New("denied") }
+
+func TestFailedStoreKeepsAddressRecord(t *testing.T) {
+	a, _, _ := newTestApp(t, "VCTX_TOKEN_STORE=keychain", "VCTX_CONTEXT=dev", "VAULT_ADDR=http://127.0.0.1:8201")
+	kr := fakeKeyring{}
+	a.keyring = kr
+	a.stdin = strings.NewReader("old")
+	if err := a.run([]string{"store"}); err != nil {
+		t.Fatal(err)
+	}
+	a.keyring = refusingKeyring{kr}
+	a.environ = withEnv(a.environ, "VAULT_ADDR=http://elsewhere:8201")
+	a.stdin = strings.NewReader("new")
+	if err := a.run([]string{"store"}); err == nil {
+		t.Fatal("store succeeded against a refusing keychain")
+	}
+	a.keyring = kr
+	if got, _ := a.tokenStatus(loadTestConfig(t, a), []string{"dev"}); got["dev"] != tokenOK {
+		t.Errorf("status after a failed store = %v, want the old token still ok", got["dev"])
 	}
 }

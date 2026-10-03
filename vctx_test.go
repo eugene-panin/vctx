@@ -25,6 +25,11 @@ contexts:
     HTTPS_PROXY: http://proxy:3128
 `
 
+// tokenPath is where the file store keeps the token of context name.
+func (a *app) tokenPath(name string) string {
+	return filepath.Join(a.stateDir, "tokens", name)
+}
+
 // withEnv returns env with kvs taking precedence; the first occurrence of a key wins.
 func withEnv(env []string, kvs ...string) []string {
 	return append(slices.Clip(kvs), env...)
@@ -67,7 +72,7 @@ func TestLoadConfigErrors(t *testing.T) {
 		name, yaml, want string
 	}{
 		{"empty", "", "no contexts"},
-		{"no addr", "contexts:\n  dev:\n    VAULT_NAMESPACE: x\n", "VAULT_ADDR is required"},
+		{"no addr", "contexts:\n  dev:\n    VAULT_NAMESPACE: x\n", "VAULT_ADDR or VAULT_AGENT_ADDR is required"},
 		{"reserved name", "contexts:\n  env:\n    VAULT_ADDR: x\n", "invalid context name"},
 		{"bad name", "contexts:\n  ../x:\n    VAULT_ADDR: x\n", "invalid context name"},
 		{"bad key", "contexts:\n  dev:\n    VAULT_ADDR: x\n    BAD-KEY: y\n", "invalid variable name"},
@@ -606,5 +611,46 @@ func TestUsageMessages(t *testing.T) {
 	err := a.run([]string{"nosuch"})
 	if !errors.As(err, &uerr) || strings.HasPrefix(err.Error(), "usage:") {
 		t.Errorf("unknown command: %v", err)
+	}
+}
+
+func TestLogoutRemovedContext(t *testing.T) {
+	a, _, _ := newTestApp(t, "VCTX_CONTEXT=gone", "VAULT_ADDR=http://v")
+	a.stdin = strings.NewReader("tok")
+	if err := a.run([]string{"store"}); err != nil {
+		t.Fatal(err)
+	}
+	a.environ = withEnv(a.environ, "VCTX_CONTEXT=") // logout by name, not by this shell
+	if err := a.run([]string{"logout", "gone"}); err != nil {
+		t.Fatalf("logout of a context no longer in the config: %v", err)
+	}
+	if _, err := os.Stat(a.tokenPath("gone")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("token left: %v", err)
+	}
+	if err := a.run([]string{"logout", "never"}); err == nil {
+		t.Error("logout of an unknown context without a token succeeded")
+	}
+}
+
+func TestUseHidesCredentials(t *testing.T) {
+	a, _, _ := newTestApp(t)
+	var stderr bytes.Buffer
+	a.stderr = &stderr
+	writeContexts(t, a, map[string]string{"cred": "http://user:s3cret@127.0.0.1:18200"})
+	if err := a.run([]string{"use", "cred"}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(stderr.String(), "s3cret") {
+		t.Errorf("use printed the password: %q", stderr.String())
+	}
+}
+
+func TestFlagsAreUsageErrors(t *testing.T) {
+	a, _, _ := newTestApp(t)
+	var uerr usageError
+	for _, args := range [][]string{{"logout", "-h"}, {"use", "-h"}} {
+		if err := a.run(args); !errors.As(err, &uerr) {
+			t.Errorf("%q: err = %v, want a usage error", args, err)
+		}
 	}
 }

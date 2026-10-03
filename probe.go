@@ -201,7 +201,7 @@ type health struct {
 }
 
 // decodeHealth parses a sys/health body; ok is false when it is not one.
-func decodeHealth(r io.Reader) (h health, ok bool) {
+func decodeHealth(body []byte) (h health, ok bool) {
 	var wire struct {
 		Initialized        *bool  `json:"initialized"`
 		Sealed             bool   `json:"sealed"`
@@ -210,7 +210,7 @@ func decodeHealth(r io.Reader) (h health, ok bool) {
 		Removed            bool   `json:"removed_from_cluster"`
 		Version            string `json:"version"`
 	}
-	if err := json.NewDecoder(io.LimitReader(r, 64<<10)).Decode(&wire); err != nil || wire.Initialized == nil {
+	if err := json.Unmarshal(body, &wire); err != nil || wire.Initialized == nil {
 		return health{}, false
 	}
 	return health{
@@ -253,13 +253,28 @@ type notVaultError struct {
 	location    string
 }
 
-// proxyError is a proxy refusing to tunnel to Vault (a CONNECT answered with 403 or 407).
+// proxyError is a proxy answering CONNECT with anything but 200: refusing the
+// tunnel (403, 407) or failing to reach Vault itself (502, 504).
 type proxyError struct {
 	proxy string
-	err   error
+	err   error // net/http keeps only the status text
 }
 
-func (e *proxyError) Error() string { return "proxy " + e.proxy + " refused: " + e.err.Error() }
+// upstream reports a proxy that accepted the tunnel but could not reach the server.
+func (e *proxyError) upstream() bool {
+	switch e.err.Error() {
+	case "Bad Gateway", "Service Unavailable", "Gateway Timeout":
+		return true
+	}
+	return false
+}
+
+func (e *proxyError) Error() string {
+	if e.upstream() {
+		return "proxy " + e.proxy + " cannot reach the server: " + e.err.Error()
+	}
+	return "proxy " + e.proxy + " refused: " + e.err.Error()
+}
 func (e *proxyError) Unwrap() error { return e.err }
 
 func (e *notVaultError) Error() string {
@@ -338,7 +353,7 @@ func probe(ctx context.Context, t target, env []string, timeout time.Duration) p
 	}
 	// sys/health signals node state through many status codes (429 standby,
 	// 503 sealed, 474 HA unhealthy, 530 removed, ...); the body tells Vault apart.
-	if h, ok := decodeHealth(bytes.NewReader(body)); ok {
+	if h, ok := decodeHealth(body); ok {
 		return probeResult{health: &h, latency: latency}
 	}
 	// Go's TLS servers, Vault included, answer plain HTTP with this 400.
@@ -410,6 +425,8 @@ func classify(err error) (short, long string) {
 	switch {
 	case errors.As(err, &cfgErr):
 		return "config error", "config: " + sanitize(cfgErr.Error(), 300)
+	case errors.As(err, &pxErr) && pxErr.upstream():
+		return "proxy can't reach", "unreachable: " + sanitize(pxErr.Error(), 300)
 	case errors.As(err, &pxErr):
 		return "blocked by proxy", "blocked: " + sanitize(pxErr.Error(), 300)
 	case errors.As(err, &nv):
@@ -423,7 +440,7 @@ func classify(err error) (short, long string) {
 		if errors.As(err, &opErr) && isTLSAlert(err) {
 			err = opErr.Err
 		}
-		return "tls error", "tls: " + sanitize(err.Error(), 300)
+		return "tls error", "tls: " + sanitize(strings.TrimPrefix(err.Error(), "tls: "), 300)
 	// net/http reports this case only as text.
 	case notTLS(err):
 		return "not tls", "tls: server does not speak TLS (http:// instead of https://?)"

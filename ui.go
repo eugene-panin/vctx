@@ -48,24 +48,34 @@ func newPalette(w io.Writer) palette {
 	}
 }
 
+// Columns of the status table, in the order statusColumns builds them.
+const (
+	colMark = iota // current context
+	colName
+	colAddr
+	colStatus
+	colLatency
+	colToken
+)
+
 // column styles a cell of the status table built by statusColumns.
 func (p palette) column(c int, lvl level, tok tokenState, selected, probing bool) lipgloss.Style {
 	switch c {
-	case 0:
+	case colMark:
 		return p.accent
-	case 1:
+	case colName:
 		if selected {
 			return p.accent
 		}
 		return p.bold
-	case 2, 4:
+	case colAddr, colLatency:
 		return p.dim
-	case 3:
+	case colStatus:
 		if probing {
 			return p.dim
 		}
 		return p.level(lvl)
-	case 5:
+	case colToken:
 		if tok == tokenStale {
 			return p.warn
 		}
@@ -115,12 +125,12 @@ func (a *app) withSpinner(title string, fn func()) {
 // statusColumns lays out contexts as table columns; the first is the current-context marker.
 func statusColumns(statuses []contextStatus, current string, tokens map[string]tokenState) ([]column, []level) {
 	cols := []column{
-		{header: ""},
-		{header: "CONTEXT", min: 8, shrink: 4},
-		{header: "ADDRESS", min: 12, shrink: 1},
-		{header: "STATUS", min: 10, shrink: 5},
-		{header: "LATENCY", right: true, drop: 3},
-		{header: "TOKEN", drop: 2},
+		colMark:    {header: ""},
+		colName:    {header: "CONTEXT", min: 8, shrink: 4},
+		colAddr:    {header: "ADDRESS", min: 12, shrink: 1},
+		colStatus:  {header: "STATUS", min: 10, shrink: 5},
+		colLatency: {header: "LATENCY", right: true, drop: 3},
+		colToken:   {header: "TOKEN", drop: 2},
 	}
 	levels := make([]level, len(statuses))
 	for i, s := range statuses {
@@ -210,7 +220,7 @@ func (a *app) renderStatusTable(cfg *config, statuses []contextStatus, current s
 
 func (a *app) printUsing(name string, cfg *config) {
 	vars, _ := cfg.vars(name, a.home)
-	addr := vaultAddr(vars)
+	addr := redactAddr(vaultAddr(vars))
 	override := a.shellOverride(name)
 	if !a.stderrTTY {
 		fmt.Fprintf(a.stderr, "using %s (%s)\n", name, addr)

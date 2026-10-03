@@ -271,7 +271,7 @@ func TestTLSAlertLeftToVault(t *testing.T) {
 	if !isTLSError(r.err) || networkProblem(r.err) {
 		t.Fatalf("err = %v: tls %v, network %v", r.err, isTLSError(r.err), networkProblem(r.err))
 	}
-	if short, long := classify(r.err); short != "tls error" || strings.Contains(long, "unreachable") {
+	if short, long := classify(r.err); short != "tls error" || strings.Contains(long, "unreachable") || strings.Contains(long, "tls: tls:") {
 		t.Errorf("short %q, long %q", short, long)
 	}
 
@@ -521,5 +521,15 @@ func TestUnparsableAddressRedacted(t *testing.T) {
 		if strings.Contains(out.String(), "s3cret") {
 			t.Errorf("%v shows the password:\n%s", args, out)
 		}
+	}
+}
+
+func TestProxyCannotReachUpstream(t *testing.T) {
+	proxy := serve(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "upstream down", http.StatusBadGateway)
+	}))
+	r := probeEnv(t, []string{"VAULT_ADDR=https://vault.example.com", "VAULT_PROXY_ADDR=" + proxy})
+	if short, long := classify(r.err); short != "proxy can't reach" || !strings.Contains(long, "cannot reach") || !networkProblem(r.err) {
+		t.Errorf("short %q, long %q", short, long)
 	}
 }

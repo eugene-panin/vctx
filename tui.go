@@ -162,7 +162,7 @@ func (m *model) forget(name string) tea.Cmd {
 	return func() tea.Msg {
 		store, err := a.tokens()
 		if err == nil {
-			err = a.forgetToken(store, name)
+			err = store.del(name)
 		}
 		return forgetMsg{name: name, err: err}
 	}
@@ -386,8 +386,8 @@ func (m *model) tableView(width, height int) string {
 	cols, levels := statusColumns(statuses, m.current, m.tokens)
 	for i, r := range m.rows {
 		if r.probing {
-			cols[3].cells[i] = "checking"
-			cols[4].cells[i] = ""
+			cols[colStatus].cells[i] = "checking"
+			cols[colLatency].cells[i] = ""
 		}
 	}
 	const gutter = 2
@@ -411,7 +411,7 @@ func (m *model) tableView(width, height int) string {
 			gut = m.p.accent.Render("▌") + " "
 		}
 		lines = append(lines, line(gut, func(c int) string {
-			if c == 3 && m.rows[i].probing {
+			if c == colStatus && m.rows[i].probing {
 				return m.spin.View() + " checking"
 			}
 			return cols[c].cells[i]
@@ -450,13 +450,10 @@ func (m *model) detailView(width, height int) string {
 		return lipgloss.NewStyle().Width(max(inner-indent, 10)).Render(s)
 	}
 
-	addrKey := "VAULT_ADDR"
-	if r.vars["VAULT_AGENT_ADDR"] != "" {
-		addrKey = "VAULT_AGENT_ADDR"
-	}
+	addr, addrKey := addrFrom(func(k string) string { return r.vars[k] })
 	var b strings.Builder
 	b.WriteString(m.p.accent.Render(r.status.name) + "\n")
-	b.WriteString(m.p.dim.Render(truncate(redactAddr(r.vars[addrKey]), inner)) + "\n\n")
+	b.WriteString(m.p.dim.Render(truncate(redactAddr(addr), inner)) + "\n\n")
 
 	switch text, lvl := r.status.shortSummary(); {
 	case r.probing:
@@ -527,7 +524,7 @@ func indentLines(s string, n int) string {
 // ui runs the full-screen interface; picking a context with enter makes it the default.
 func (a *app) ui() error {
 	if !a.stdinTTY || !a.stdoutTTY {
-		return usageError("usage: vctx use <context>; the interactive UI needs a terminal")
+		return usageError("the interactive UI needs a terminal; use 'vctx use <context>' to set the default")
 	}
 	cfg, err := a.loadConfig()
 	if err != nil {

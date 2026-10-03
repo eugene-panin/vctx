@@ -73,7 +73,7 @@ func loadConfig(path string) (*config, error) {
 			return nil, fmt.Errorf("%s: context %s: %w", path, name, err)
 		}
 		if vars, _ := c.vars(name, ""); vaultAddr(vars) == "" {
-			return nil, fmt.Errorf("%s: context %s: VAULT_ADDR is required", path, name)
+			return nil, fmt.Errorf("%s: context %s: VAULT_ADDR or VAULT_AGENT_ADDR is required", path, name)
 		}
 	}
 	return &c, nil

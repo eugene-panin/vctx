@@ -3,12 +3,8 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"io"
-	"io/fs"
-	"os"
-	"path/filepath"
 	"strings"
 )
 
@@ -16,34 +12,6 @@ const defaultVaultAddr = "https://127.0.0.1:8200"
 
 func isHelperOp(s string) bool {
 	return s == "get" || s == "store" || s == "erase"
-}
-
-// tokenPath is where the file store keeps the token of context name.
-func (a *app) tokenPath(name string) string {
-	return filepath.Join(a.stateDir, "tokens", name)
-}
-
-// addrPath records, next to the secret store, the address a token was issued
-// for, so status can be shown without reading the secret.
-func (a *app) addrPath(key string) string {
-	return filepath.Join(a.stateDir, "addrs", filepath.FromSlash(key))
-}
-
-func (a *app) storeToken(store tokenStore, key, addr, token string) error {
-	if err := store.set(key, addr+"\n"+token+"\n"); err != nil {
-		return err
-	}
-	return writeFileAtomic(a.addrPath(key), []byte(addr+"\n"), 0o600)
-}
-
-func (a *app) forgetToken(store tokenStore, key string) error {
-	if err := store.del(key); err != nil {
-		return err
-	}
-	if err := os.Remove(a.addrPath(key)); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return err
-	}
-	return nil
 }
 
 // tokenKey picks the token for the calling vault process: by context when
@@ -66,11 +34,10 @@ func (a *app) callerAddr() string {
 // tokenHelper implements the Vault token helper protocol:
 // https://developer.hashicorp.com/vault/docs/commands/token-helper
 //
-// A stored value holds the address the token was issued for and the token,
-// one per line, so a token is never handed to vault talking to another address.
-// A token for another address, or one stored without an address, is reported as
-// missing rather than as an error: `vault login` asks for the current token
-// first and would fail, leaving no way to replace it.
+// Tokens are stored with the address they were issued for and never handed to
+// vault talking to another address. Such a token, or one stored without an
+// address, is reported as missing rather than as an error: `vault login` asks
+// for the current token first and would fail, leaving no way to replace it.
 func (a *app) tokenHelper(op string) error {
 	store, err := a.tokens()
 	if err != nil {
@@ -79,15 +46,11 @@ func (a *app) tokenHelper(op string) error {
 	key := a.tokenKey()
 	switch op {
 	case "get":
-		v, ok, err := store.get(key)
-		if err != nil || !ok {
+		token, addr, ok, err := store.get(key)
+		if err != nil || !ok || addr != a.callerAddr() {
 			return err
 		}
-		addr, token, bound := strings.Cut(strings.TrimSpace(v), "\n")
-		if !bound || strings.TrimSpace(addr) != a.callerAddr() {
-			return nil
-		}
-		_, err = io.WriteString(a.stdout, strings.TrimSpace(token))
+		_, err = io.WriteString(a.stdout, token)
 		return err
 	case "store":
 		b, err := io.ReadAll(io.LimitReader(a.stdin, 64<<10))
@@ -96,11 +59,11 @@ func (a *app) tokenHelper(op string) error {
 		}
 		token := strings.TrimSpace(string(b))
 		if token == "" {
-			return a.forgetToken(store, key)
+			return store.del(key)
 		}
-		return a.storeToken(store, key, a.callerAddr(), token)
+		return store.set(key, token, a.callerAddr())
 	case "erase":
-		return a.forgetToken(store, key)
+		return store.del(key)
 	}
 	return fmt.Errorf("unknown token helper operation %q", op)
 }
