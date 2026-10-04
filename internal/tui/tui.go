@@ -1,5 +1,4 @@
-// Package tui is vctx's full-screen interface: contexts with live status,
-// switching, logging in, and a shell in a context.
+// Package tui is vctx's full-screen interface to switch contexts and log in.
 package tui
 
 import (
@@ -19,8 +18,8 @@ import (
 	"github.com/eugene-panin/vctx/internal/config"
 	"github.com/eugene-panin/vctx/internal/environ"
 	"github.com/eugene-panin/vctx/internal/probe"
-	"github.com/eugene-panin/vctx/internal/status"
 	"github.com/eugene-panin/vctx/internal/style"
+	"github.com/eugene-panin/vctx/internal/table"
 	"github.com/eugene-panin/vctx/internal/token"
 )
 
@@ -46,7 +45,7 @@ var keys = keyMap{
 }
 
 type row struct {
-	status.Context
+	probe.Instance
 	login   []string // the login method, from the config or remembered
 	probing bool
 	gen     int // bumped per probe so a late answer from an older one is ignored
@@ -96,7 +95,7 @@ type model struct {
 	tokenGen     int // bumped per load, and on forget, so a late answer is ignored
 }
 
-func newModel(b Backend, contexts []status.Context, timeout time.Duration, out io.Writer) *model {
+func newModel(b Backend, contexts []probe.Instance, timeout time.Duration, out io.Writer) *model {
 	if timeout == 0 {
 		timeout = probe.DefaultTimeout
 	}
@@ -114,7 +113,7 @@ func newModel(b Backend, contexts []status.Context, timeout time.Duration, out i
 		if c.Status.Name == m.current {
 			m.cursor = len(m.rows)
 		}
-		m.rows = append(m.rows, row{Context: c, login: b.LoginMethod(c.Status.Name)})
+		m.rows = append(m.rows, row{Instance: c, login: b.LoginMethod(c.Status.Name)})
 	}
 	return m
 }
@@ -139,7 +138,7 @@ func (m *model) probe(i int) tea.Cmd {
 	}
 	m.rows[i].probing = true
 	m.rows[i].gen++
-	p, gen, timeout := m.rows[i].Context, m.rows[i].gen, m.timeout
+	p, gen, timeout := m.rows[i].Instance, m.rows[i].gen, m.timeout
 	return func() tea.Msg {
 		return probeMsg{i: i, gen: gen, res: p.Probe(timeout)}
 	}
@@ -363,7 +362,7 @@ func (m *model) headerView() string {
 			continue
 		}
 		done++
-		if _, lvl := r.Status.Short(); lvl == status.OK {
+		if _, lvl := r.Status.Short(); lvl == probe.OK {
 			ok++
 		}
 	}
@@ -380,31 +379,31 @@ func (m *model) headerView() string {
 }
 
 func (m *model) tableView(width, height int) string {
-	statuses := make([]status.Status, len(m.rows))
+	statuses := make([]probe.Status, len(m.rows))
 	for i, r := range m.rows {
 		statuses[i] = r.Status
 	}
-	cols, levels := statusColumns(statuses, m.current, m.tokens)
+	cols, levels := table.Columns(statuses, m.current, m.tokens)
 	for i, r := range m.rows {
 		if r.probing {
-			cols[colStatus].cells[i] = "checking"
-			cols[colLatency].cells[i] = ""
+			cols[table.ColStatus].Cells[i] = "checking"
+			cols[table.ColLatency].Cells[i] = ""
 		}
 	}
 	const gutter = 2
-	widths := fitColumns(cols, width-gutter, 2)
+	widths := table.Fit(cols, width-gutter, 2)
 	visible := max(height-1, 1)
 
 	line := func(gut string, value func(c int) string, style func(c int) lipgloss.Style) string {
 		var parts []string
 		for c, col := range cols {
 			if widths[c] > 0 {
-				parts = append(parts, cell(value(c), widths[c], col.right, style(c)))
+				parts = append(parts, table.Cell(value(c), widths[c], col.Right, style(c)))
 			}
 		}
 		return truncate(gut+strings.Join(parts, "  "), width)
 	}
-	lines := []string{line("  ", func(c int) string { return cols[c].header }, func(int) lipgloss.Style { return m.p.Dim })}
+	lines := []string{line("  ", func(c int) string { return cols[c].Header }, func(int) lipgloss.Style { return m.p.Dim })}
 	for i := m.offset; i < min(m.offset+visible, len(m.rows)); i++ {
 		selected := i == m.cursor
 		gut := "  "
@@ -412,12 +411,12 @@ func (m *model) tableView(width, height int) string {
 			gut = m.p.Accent.Render("▌") + " "
 		}
 		lines = append(lines, line(gut, func(c int) string {
-			if c == colStatus && m.rows[i].probing {
+			if c == table.ColStatus && m.rows[i].probing {
 				return m.spin.View() + " checking"
 			}
-			return cols[c].cells[i]
+			return cols[c].Cells[i]
 		}, func(c int) lipgloss.Style {
-			return columnStyle(m.p, c, levels[i], m.tokens[m.rows[i].Status.Name], selected, m.rows[i].probing)
+			return table.CellStyle(m.p, c, levels[i], m.tokens[m.rows[i].Status.Name], selected, m.rows[i].probing)
 		}))
 	}
 	return strings.Join(lines, "\n")
@@ -463,10 +462,10 @@ func (m *model) detailView(width, height int) string {
 		b.WriteString(label("status") + m.spin.View() + m.p.Dim.Render(" checking") + "\n")
 	case r.Status.Err != nil:
 		_, long := probe.Classify(r.Status.Err)
-		b.WriteString(label("status") + levelStyle(m.p, lvl).Render(text) + "\n")
+		b.WriteString(label("status") + table.LevelStyle(m.p, lvl).Render(text) + "\n")
 		b.WriteString(indentLines(m.p.Dim.Render(wrap(long, 8)), 8) + "\n")
 	default:
-		b.WriteString(label("status") + levelStyle(m.p, lvl).Render(text) + m.p.Dim.Render("  "+r.Status.LatencyText()) + "\n")
+		b.WriteString(label("status") + table.LevelStyle(m.p, lvl).Render(text) + m.p.Dim.Render("  "+r.Status.LatencyText()) + "\n")
 	}
 
 	if args := r.login; args != nil {
@@ -519,7 +518,7 @@ func truncate(s string, w int) string {
 	if lipgloss.Width(s) <= w {
 		return s
 	}
-	return cell(s, w, false, lipgloss.NewStyle())
+	return table.Cell(s, w, false, lipgloss.NewStyle())
 }
 
 func indentLines(s string, n int) string {
@@ -547,7 +546,7 @@ type Backend interface {
 
 // Run shows the interface until the user quits or picks a context with
 // enter, which it returns after b.Use has made it the default.
-func Run(b Backend, contexts []status.Context, timeout time.Duration, in io.Reader, out io.Writer) (chosen string, err error) {
+func Run(b Backend, contexts []probe.Instance, timeout time.Duration, in io.Reader, out io.Writer) (chosen string, err error) {
 	m := newModel(b, contexts, timeout, out)
 	if _, err := tea.NewProgram(m, tea.WithAltScreen(), tea.WithInput(in), tea.WithOutput(out)).Run(); err != nil {
 		return "", err

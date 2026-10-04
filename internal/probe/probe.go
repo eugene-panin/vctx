@@ -1,6 +1,7 @@
-// Package probe checks whether a Vault instance can be reached the way the
-// Vault CLI would reach it, with an unauthenticated GET /v1/sys/health, and
-// explains failures.
+// Package probe checks whether the Vault CLI can reach a Vault instance.
+//
+// It sends the unauthenticated GET /v1/sys/health with the TLS and proxy
+// settings vault would use, and explains failures.
 package probe
 
 import (
@@ -31,11 +32,11 @@ import (
 // DefaultTimeout bounds a probe unless VCTX_CHECK_TIMEOUT says otherwise.
 const DefaultTimeout = 3 * time.Second
 
-// ConfigError is a context setting vctx cannot use, as opposed to a network failure.
-type ConfigError struct{ err error }
+// configError is a context setting vctx cannot use, as opposed to a network failure.
+type configError struct{ err error }
 
-func (e *ConfigError) Error() string { return e.err.Error() }
-func (e *ConfigError) Unwrap() error { return e.err }
+func (e *configError) Error() string { return e.err.Error() }
+func (e *configError) Unwrap() error { return e.err }
 
 // Target is where vault will send requests for a given environment.
 type Target struct {
@@ -61,25 +62,25 @@ func TargetFor(env []string) (Target, error) {
 	}
 	u, err := url.Parse(raw)
 	if err != nil {
-		return Target{}, &ConfigError{fmt.Errorf("parse %s: %w", from, parseReason(err))}
+		return Target{}, &configError{fmt.Errorf("parse %s: %w", from, parseReason(err))}
 	}
 	switch u.Scheme {
 	case "unix":
 		// Like Vault, take everything after the scheme: url.Parse puts a relative path in Host.
 		path := strings.TrimPrefix(raw, "unix://")
 		if path == "" || path == raw {
-			return Target{}, &ConfigError{fmt.Errorf("%s: unix:// needs a socket path", from)}
+			return Target{}, &configError{fmt.Errorf("%s: unix:// needs a socket path", from)}
 		}
 		return Target{addr: &url.URL{Scheme: "http", Host: "localhost"}, unix: path}, nil
 	case "http", "https":
 	default:
-		return Target{}, &ConfigError{fmt.Errorf("%s %q: want http://, https:// or unix://", from, config.RedactAddr(raw))}
+		return Target{}, &configError{fmt.Errorf("%s %q: want http://, https:// or unix://", from, config.RedactAddr(raw))}
 	}
 
 	t := Target{addr: u}
 	if p := get("VAULT_PROXY_ADDR", "VAULT_HTTP_PROXY"); p != "" {
 		if t.proxy, err = url.Parse(p); err != nil {
-			return Target{}, &ConfigError{fmt.Errorf("proxy settings for %s: VAULT_PROXY_ADDR: %w", u.Host, parseReason(err))}
+			return Target{}, &configError{fmt.Errorf("proxy settings for %s: VAULT_PROXY_ADDR: %w", u.Host, parseReason(err))}
 		}
 	} else {
 		cfg := httpproxy.Config{
@@ -89,11 +90,11 @@ func TargetFor(env []string) (Target, error) {
 		}
 		// The error quotes the proxy URL, credentials included, so it is not passed on.
 		if t.proxy, err = cfg.ProxyFunc()(u); err != nil {
-			return Target{}, &ConfigError{fmt.Errorf("proxy settings for %s: invalid HTTP(S)_PROXY", u.Host)}
+			return Target{}, &configError{fmt.Errorf("proxy settings for %s: invalid HTTP(S)_PROXY", u.Host)}
 		}
 	}
 	if t.proxy != nil && t.proxy.Host == "" {
-		return Target{}, &ConfigError{fmt.Errorf("proxy settings for %s: no host in %q", u.Host, t.proxy.Redacted())}
+		return Target{}, &configError{fmt.Errorf("proxy settings for %s: no host in %q", u.Host, t.proxy.Redacted())}
 	}
 	return t, nil
 }
@@ -256,35 +257,35 @@ func (h Health) String() string {
 	return h.Version + " " + state
 }
 
-// NotVaultError means something answered at VAULT_ADDR, but not the Vault API:
+// notVaultError means something answered at VAULT_ADDR, but not the Vault API:
 // typically an ingress or firewall rejecting the client's IP, or redirecting to a login page.
-type NotVaultError struct {
+type notVaultError struct {
 	Status      int
 	ContentType string
 	Location    string
 }
 
-// ProxyError is a proxy answering CONNECT with anything but 200: refusing the
+// proxyError is a proxy answering CONNECT with anything but 200: refusing the
 // tunnel (403, 407) or failing to reach Vault itself (502, 503, 504).
-type ProxyError struct {
+type proxyError struct {
 	proxy  string
 	status string // as sent, e.g. "504 Gateway Time-out"
 	code   int
 }
 
 // upstream reports a proxy that accepted the tunnel but could not reach the server.
-func (e *ProxyError) upstream() bool {
+func (e *proxyError) upstream() bool {
 	return e.code == http.StatusBadGateway || e.code == http.StatusServiceUnavailable || e.code == http.StatusGatewayTimeout
 }
 
-func (e *ProxyError) Error() string {
+func (e *proxyError) Error() string {
 	if e.upstream() {
 		return "proxy " + e.proxy + " cannot reach the server: " + e.status
 	}
 	return "proxy " + e.proxy + " refused: " + e.status
 }
 
-func (e *NotVaultError) Error() string {
+func (e *notVaultError) Error() string {
 	if e.Location != "" {
 		return fmt.Sprintf("HTTP %d redirect to %s, not the Vault API", e.Status, e.Location)
 	}
@@ -302,7 +303,7 @@ type Result struct {
 func Probe(ctx context.Context, t Target, env []string, timeout time.Duration) Result {
 	tlsCfg, err := tlsConfig(env)
 	if err != nil {
-		return Result{Err: &ConfigError{err}}
+		return Result{Err: &configError{err}}
 	}
 	tr := &http.Transport{
 		Proxy: func(*http.Request) (*url.URL, error) { return t.proxy, nil },
@@ -311,7 +312,7 @@ func Probe(ctx context.Context, t Target, env []string, timeout time.Duration) R
 			if resp.StatusCode == http.StatusOK {
 				return nil
 			}
-			return &ProxyError{proxy: proxy.Host, status: termsafe.String(resp.Status, 60), code: resp.StatusCode}
+			return &proxyError{proxy: proxy.Host, status: termsafe.String(resp.Status, 60), code: resp.StatusCode}
 		},
 		TLSClientConfig:   tlsCfg,
 		DisableKeepAlives: true,
@@ -354,15 +355,15 @@ func Probe(ctx context.Context, t Target, env []string, timeout time.Duration) R
 	}
 	// Go's TLS servers, Vault included, answer plain HTTP with this 400.
 	if resp.StatusCode == http.StatusBadRequest && bytes.Contains(body, []byte("HTTP request to an HTTPS server")) {
-		return Result{Err: &ConfigError{errors.New("the server speaks TLS: use https:// in the address")}}
+		return Result{Err: &configError{errors.New("the server speaks TLS: use https:// in the address")}}
 	}
 	// For an http:// address the proxy forwards the request instead of opening
 	// a tunnel, so its own gateway errors arrive as ordinary responses.
-	if pe := (&ProxyError{code: resp.StatusCode}); t.proxy != nil && t.addr.Scheme == "http" && pe.upstream() {
+	if pe := (&proxyError{code: resp.StatusCode}); t.proxy != nil && t.addr.Scheme == "http" && pe.upstream() {
 		pe.proxy, pe.status = t.proxy.Host, termsafe.String(resp.Status, 60)
 		return Result{Err: pe}
 	}
-	notVault := &NotVaultError{Status: resp.StatusCode, ContentType: termsafe.String(resp.Header.Get("Content-Type"), 40)}
+	notVault := &notVaultError{Status: resp.StatusCode, ContentType: termsafe.String(resp.Header.Get("Content-Type"), 40)}
 	if notVault.ContentType == "" {
 		notVault.ContentType = "no content type"
 	}
@@ -382,7 +383,10 @@ func notTLS(err error) bool {
 // connClosed matches a server that accepted the connection and dropped it,
 // such as a Vault cluster port spoken to over HTTP.
 func connClosed(err error) bool {
-	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, syscall.ECONNRESET)
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, syscall.ECONNRESET) ||
+		// net/http's unexported errServerClosedIdle: the server closed the
+		// connection before the request went out.
+		strings.Contains(err.Error(), "http: server closed idle connection")
 }
 
 // IsTLSError reports a failed TLS handshake: a certificate the client rejects,
@@ -405,9 +409,9 @@ func isTLSAlert(err error) bool {
 // Classify describes err twice: a compact label for tables and a full explanation.
 // Error text can carry server or certificate data, so it is sanitized.
 func Classify(err error) (short, long string) {
-	var cfgErr *ConfigError
-	var pxErr *ProxyError
-	var nv *NotVaultError
+	var cfgErr *configError
+	var pxErr *proxyError
+	var nv *notVaultError
 	var dnsErr *net.DNSError
 	var netErr net.Error
 	switch {
@@ -449,12 +453,12 @@ func Classify(err error) (short, long string) {
 // NetworkProblem reports whether err comes from the network path to Vault
 // rather than from the local configuration or a TLS handshake.
 func NetworkProblem(err error) bool {
-	var cfgErr *ConfigError
+	var cfgErr *configError
 	if IsTLSError(err) || errors.As(err, &cfgErr) {
 		return false
 	}
-	var nv *NotVaultError
-	var pxErr *ProxyError
+	var nv *notVaultError
+	var pxErr *proxyError
 	var opErr *net.OpError
 	var dnsErr *net.DNSError
 	var netErr net.Error

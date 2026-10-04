@@ -1,5 +1,4 @@
-// Package shell hooks vctx into zsh, bash and fish, so that switching a
-// context switches the terminal it was typed in.
+// Package shell hooks vctx into zsh, bash and fish, so 'vctx use' switches the terminal.
 package shell
 
 import (
@@ -127,8 +126,8 @@ func fileExists(path string) bool {
 	return err == nil
 }
 
-// InitLine loads the integration, and does nothing once vctx is uninstalled.
-func InitLine(shell string) string {
+// initLine loads the integration, and does nothing once vctx is uninstalled.
+func initLine(shell string) string {
 	if shell == "fish" {
 		return "type -q vctx; and vctx init fish | source"
 	}
@@ -158,7 +157,7 @@ func (s Setup) Install(shell string, out io.Writer) error {
 	if err != nil {
 		return err
 	}
-	block := initMarker + "\n" + InitLine(shell) + "\n"
+	block := initMarker + "\n" + initLine(shell) + "\n"
 	if len(b) > 0 && !strings.HasSuffix(string(b), "\n") {
 		block = "\n" + block
 	}
@@ -224,11 +223,13 @@ func choiceFD(osEnv []string) *os.File {
 	if err != nil || fd < 3 || fd > 9 {
 		return nil
 	}
-	f := os.NewFile(uintptr(fd), "choice")
-	if fi, err := f.Stat(); err != nil || fi.Mode()&os.ModeNamedPipe == 0 {
+	// Check before os.NewFile: a dropped *os.File would close the descriptor
+	// when collected, by then perhaps reused for something else.
+	var st syscall.Stat_t
+	if err := syscall.Fstat(fd, &st); err != nil || st.Mode&syscall.S_IFMT != syscall.S_IFIFO {
 		return nil
 	}
-	return f
+	return os.NewFile(uintptr(fd), "choice")
 }
 
 // KeepChoiceFD stops the choice descriptor from reaching anything vctx runs:

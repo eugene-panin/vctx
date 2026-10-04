@@ -1,16 +1,18 @@
 package probe
 
 import (
+	"crypto/tls"
 	"encoding/pem"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
-	"github.com/eugene-panin/vctx/internal/termsafe"
 	"github.com/eugene-panin/vctx/internal/vaulttest"
 )
 
@@ -60,9 +62,6 @@ func TestServerTextSanitized(t *testing.T) {
 	}
 	if strings.ContainsAny(r.Health.Version, "\x1b\x07") || r.Health.Version != "1.0]0;PWNED[2J" {
 		t.Errorf("version = %q", r.Health.Version)
-	}
-	if got := termsafe.String(strings.Repeat("a", 50), 40); got != strings.Repeat("a", 40)+"…" {
-		t.Errorf("long text: %q", got)
 	}
 }
 
@@ -224,5 +223,61 @@ func TestProxyGatewayErrorForPlainHTTP(t *testing.T) {
 	r := probeEnv(t, []string{"VAULT_ADDR=http://vault.example.com", "VAULT_PROXY_ADDR=" + vaulttest.RawProxy(t, "504 Gateway Time-out")})
 	if short, long := Classify(r.Err); short != "proxy can't reach" || !NetworkProblem(r.Err) {
 		t.Errorf("short %q, long %q", short, long)
+	}
+}
+
+func TestTLS(t *testing.T) {
+	srv := httptest.NewUnstartedServer(vaulttest.Handler(200, vaulttest.ActiveBody))
+	srv.Config.ErrorLog = log.New(io.Discard, "", 0)
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+	caFile := filepath.Join(t.TempDir(), "ca.pem")
+	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw})
+	if err := os.WriteFile(caFile, pemBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	env := []string{"VAULT_ADDR=" + srv.URL}
+	if r := probeEnv(t, env); !IsTLSError(r.Err) {
+		t.Errorf("without CA: err = %v, want a TLS verification error", r.Err)
+	}
+	if r := probeEnv(t, append(env, "VAULT_CACERT="+caFile)); r.Err != nil {
+		t.Errorf("with VAULT_CACERT: %v", r.Err)
+	}
+	if r := probeEnv(t, append(env, "VAULT_SKIP_VERIFY=true")); r.Err != nil {
+		t.Errorf("with VAULT_SKIP_VERIFY: %v", r.Err)
+	}
+}
+
+func TestTLSAlertIsNoNetworkProblem(t *testing.T) {
+	srv := httptest.NewUnstartedServer(vaulttest.Handler(200, vaulttest.ActiveBody))
+	srv.TLS = &tls.Config{ClientAuth: tls.RequireAnyClientCert}
+	srv.Config.ErrorLog = log.New(io.Discard, "", 0)
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+
+	r := probeEnv(t, []string{"VAULT_ADDR=" + srv.URL, "VAULT_SKIP_VERIFY=true"})
+	if !IsTLSError(r.Err) || NetworkProblem(r.Err) {
+		t.Fatalf("err = %v: tls %v, network %v", r.Err, IsTLSError(r.Err), NetworkProblem(r.Err))
+	}
+	if short, long := Classify(r.Err); short != "tls error" || strings.Contains(long, "unreachable") || strings.Contains(long, "tls: tls:") {
+		t.Errorf("short %q, long %q", short, long)
+	}
+}
+
+func TestUnhealthyNodesAreVault(t *testing.T) {
+	for _, tc := range []struct {
+		status int
+		body   string
+		want   string
+		usable bool
+	}{
+		{474, `{"initialized":true,"sealed":false,"standby":true,"version":"1.20.4"}`, "1.20.4 standby", true},
+		{530, `{"initialized":true,"sealed":false,"standby":true,"removed_from_cluster":true,"version":"1.20.4"}`, "1.20.4 removed from cluster", false},
+	} {
+		r := probeEnv(t, []string{"VAULT_ADDR=" + vaulttest.Serve(t, vaulttest.Handler(tc.status, tc.body))})
+		if r.Err != nil || r.Health.String() != tc.want || r.Health.Usable() != tc.usable {
+			t.Errorf("HTTP %d: err %v, health %+v", tc.status, r.Err, r.Health)
+		}
 	}
 }

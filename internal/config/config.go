@@ -1,5 +1,4 @@
-// Package config loads vctx's contexts: named sets of environment variables
-// for the Vault CLI, plus how to log in to each.
+// Package config loads vctx's contexts: named sets of variables for the Vault CLI.
 package config
 
 import (
@@ -7,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"maps"
 	"net/url"
 	"os"
@@ -15,11 +13,12 @@ import (
 	"regexp"
 	"slices"
 	"strings"
-	"syscall"
 
+	"github.com/eugene-panin/vctx/internal/safefile"
 	"gopkg.in/yaml.v3"
 )
 
+// Config is the parsed config file: variables for every context, and each context's own.
 type Config struct {
 	Defaults map[string]string            `yaml:"defaults"`
 	Contexts map[string]map[string]string `yaml:"contexts"`
@@ -28,9 +27,6 @@ type Config struct {
 var (
 	nameRe   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 	envKeyRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
-
-	// Context names double as subcommands ("vctx prod ..."), so they must not shadow real ones.
-	reservedNames = []string{"help", "version", "ui", "init", "ls", "list", "use", "current", "env", "exec", "check", "logout", "get", "store", "erase"}
 )
 
 // DefaultAddr is where the Vault CLI goes without VAULT_ADDR.
@@ -53,7 +49,7 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
-	if err := CheckPrivate(path, fi); err != nil {
+	if err := safefile.CheckPrivate(path, fi); err != nil {
 		return nil, err
 	}
 	const maxSize = 1 << 20
@@ -79,7 +75,7 @@ func Load(path string) (*Config, error) {
 	}
 	seen := make(map[string]string, len(c.Contexts))
 	for _, name := range slices.Sorted(maps.Keys(c.Contexts)) {
-		if !nameRe.MatchString(name) || slices.Contains(reservedNames, name) {
+		if !nameRe.MatchString(name) {
 			return nil, fmt.Errorf("%s: invalid context name %q", path, name)
 		}
 		// Names become file names, and macOS file systems ignore case by default.
@@ -134,19 +130,6 @@ func RedactAddr(s string) string {
 	return s
 }
 
-// CheckPrivate refuses a file or directory another user could modify, as ssh does:
-// the config decides which variables (PATH included) vault runs with, and the
-// state directory holds the token helper setting vault executes.
-func CheckPrivate(path string, fi fs.FileInfo) error {
-	if perm := fi.Mode().Perm(); perm&0o022 != 0 {
-		return fmt.Errorf("%s is writable by group or others (mode %04o), fix with: chmod go-w %s", path, perm, path)
-	}
-	if st, ok := fi.Sys().(*syscall.Stat_t); ok && int(st.Uid) != os.Getuid() {
-		return fmt.Errorf("%s is owned by another user", path)
-	}
-	return nil
-}
-
 // loginKey holds the arguments for `vault login`; unlike the other keys of a
 // context it is not an environment variable.
 const loginKey = "login"
@@ -193,7 +176,7 @@ func (c *Config) Login(name string) []string {
 	if !ok {
 		v = c.Defaults[loginKey]
 	}
-	args, _ := LoginArgs(v) // validated by loadConfig
+	args, _ := LoginArgs(v) // validated by Load
 	return args
 }
 

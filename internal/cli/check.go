@@ -5,12 +5,13 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"sync"
 	"text/tabwriter"
 	"time"
 
 	"github.com/eugene-panin/vctx/internal/probe"
-	"github.com/eugene-panin/vctx/internal/status"
-	"github.com/eugene-panin/vctx/internal/tui"
+	"github.com/eugene-panin/vctx/internal/style"
+	"github.com/eugene-panin/vctx/internal/table"
 )
 
 // checkTimeout reads VCTX_CHECK_TIMEOUT; zero disables the check.
@@ -70,14 +71,14 @@ func (a *app) check(args []string) error {
 	if timeout == 0 {
 		timeout = probe.DefaultTimeout
 	}
-	ps := make([]status.Context, len(names))
+	ps := make([]probe.Instance, len(names))
 	for i, name := range names {
-		if ps[i], err = status.Prepare(cfg, name, a.environ, a.home); err != nil {
+		if ps[i], err = probe.Resolve(cfg, name, a.environ, a.home); err != nil {
 			return err
 		}
 	}
-	tui.Spin(a.stderr, a.stderrTTY, fmt.Sprintf("checking %d instances", len(names)), func() { status.ProbeAll(ps, timeout) })
-	statuses := make([]status.Status, len(ps))
+	a.spin(fmt.Sprintf("checking %d instances", len(names)), func() { probe.All(ps, timeout) })
+	statuses := make([]probe.Status, len(ps))
 	for i := range ps {
 		statuses[i] = ps[i].Status
 	}
@@ -85,12 +86,12 @@ func (a *app) check(args []string) error {
 	if a.stdoutTTY {
 		current, _ := a.contextName("")
 		tokens, tokenErr := a.tokenStatus(cfg, names)
-		fmt.Fprintln(a.stdout, tui.StatusTable(a.stdout, statuses, current, tokens, tokenErr))
+		fmt.Fprintln(a.stdout, table.Render(a.stdout, statuses, current, tokens, tokenErr))
 	} else {
 		tw := tabwriter.NewWriter(a.stdout, 0, 4, 2, ' ', 0)
 		for _, s := range statuses {
 			text, lvl := s.Summary()
-			if lvl == status.OK {
+			if lvl == probe.OK {
 				text += " " + s.LatencyText()
 			}
 			fmt.Fprintf(tw, "%s\t%s\t%s\n", s.Name, s.Endpoint, text)
@@ -102,7 +103,7 @@ func (a *app) check(args []string) error {
 
 	failed := 0
 	for _, s := range statuses {
-		if _, lvl := s.Summary(); lvl != status.OK {
+		if _, lvl := s.Summary(); lvl != probe.OK {
 			failed++
 		}
 	}
@@ -113,4 +114,33 @@ func (a *app) check(args []string) error {
 		return errSilent
 	}
 	return fmt.Errorf("%d of %d contexts not usable", failed, len(names))
+}
+
+// spin runs fn, animating a spinner on stderr when it is a terminal.
+func (a *app) spin(title string, fn func()) {
+	if !a.stderrTTY {
+		fn()
+		return
+	}
+	f := a.stderr
+	p := style.New(f)
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		frames := []rune("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
+		tick := time.NewTicker(80 * time.Millisecond)
+		defer tick.Stop()
+		for i := 0; ; i++ {
+			fmt.Fprintf(f, "\r%s %s", p.Accent.Render(string(frames[i%len(frames)])), p.Dim.Render(title))
+			select {
+			case <-done:
+				fmt.Fprint(f, "\r\x1b[2K")
+				return
+			case <-tick.C:
+			}
+		}
+	})
+	fn()
+	close(done)
+	wg.Wait()
 }

@@ -8,9 +8,9 @@ import (
 	"path/filepath"
 
 	"github.com/charmbracelet/x/term"
-	"github.com/eugene-panin/vctx/internal/atomicfile"
 	"github.com/eugene-panin/vctx/internal/config"
 	"github.com/eugene-panin/vctx/internal/environ"
+	"github.com/eugene-panin/vctx/internal/safefile"
 	"github.com/eugene-panin/vctx/internal/shell"
 	"github.com/eugene-panin/vctx/internal/style"
 )
@@ -46,6 +46,6 @@ func (a *app) printUsing(name string, cfg *config.Config) {
 	marker := filepath.Join(a.stateDir, "hint-init")
 	if _, err := os.Stat(marker); errors.Is(err, fs.ErrNotExist) {
 		fmt.Fprintln(a.stderr, p.Dim.Render("  tip: run `vctx init` once, and this terminal and plain `vault` follow `vctx use`"))
-		_ = atomicfile.Write(marker, nil, 0o600)
+		_ = safefile.Write(marker, nil, 0o600)
 	}
 }

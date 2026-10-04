@@ -14,38 +14,9 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/eugene-panin/vctx/internal/config"
 	"github.com/eugene-panin/vctx/internal/probe"
-	"github.com/eugene-panin/vctx/internal/status"
 	"github.com/eugene-panin/vctx/internal/token"
 	"github.com/eugene-panin/vctx/internal/vaulttest"
 )
-
-func TestFitColumns(t *testing.T) {
-	cols := []column{
-		{header: "", cells: []string{"●"}},
-		{header: "CONTEXT", cells: []string{"matchsystems"}, min: 8, shrink: 2},
-		{header: "ADDRESS", cells: []string{"vault.matchsystems.tech"}, min: 12, shrink: 1},
-		{header: "STATUS", cells: []string{"blocked (HTTP 403)"}, min: 10, shrink: 5},
-		{header: "LATENCY", cells: []string{"300ms"}, drop: 4},
-		{header: "TOKEN", cells: []string{"✓"}, drop: 3},
-	}
-	tests := []struct {
-		total int
-		want  []int
-	}{
-		{200, []int{1, 12, 23, 18, 7, 5}},
-		{70, []int{1, 12, 17, 18, 7, 5}}, // address gives way first
-		{62, []int{1, 9, 12, 18, 7, 5}},  // then the name
-		{55, []int{1, 8, 12, 18, 7, 0}},  // then the token column goes
-		{45, []int{1, 8, 12, 18, 0, 0}},  // then latency
-		{40, []int{1, 8, 12, 13, 0, 0}},  // status is truncated last
-		{20, []int{1, 8, 12, 10, 0, 0}},  // nothing left to give
-	}
-	for _, tc := range tests {
-		if got := fitColumns(cols, tc.total, 2); !slices.Equal(got, tc.want) {
-			t.Errorf("total %d: got %v, want %v", tc.total, got, tc.want)
-		}
-	}
-}
 
 // fakeBackend keeps what the UI asks for in memory.
 type fakeBackend struct {
@@ -83,7 +54,7 @@ func (f *fakeBackend) CommandEnv(map[string]string) ([]string, error) {
 	return []string{"PATH=/usr/bin:/bin"}, nil
 }
 
-// testConfig mirrors the CLI tests' config: dev and prod, with a default.
+// testConfig has two contexts and a default.
 var testConfig = &config.Config{
 	Defaults: map[string]string{"VAULT_FORMAT": "json"},
 	Contexts: map[string]map[string]string{
@@ -92,11 +63,11 @@ var testConfig = &config.Config{
 	},
 }
 
-func prepare(t *testing.T, cfg *config.Config) []status.Context {
+func prepare(t *testing.T, cfg *config.Config) []probe.Instance {
 	t.Helper()
-	var out []status.Context
+	var out []probe.Instance
 	for _, name := range slices.Sorted(maps.Keys(cfg.Contexts)) {
-		c, err := status.Prepare(cfg, name, []string{"PATH=/usr/bin:/bin"}, "/home/u")
+		c, err := probe.Resolve(cfg, name, []string{"PATH=/usr/bin:/bin"}, "/home/u")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -117,7 +88,11 @@ func newTestModel(t *testing.T) (*model, *fakeBackend) {
 	m, b := newModelFor(t, testConfig)
 	m.rows[0].Status.Result = probe.Result{Health: &probe.Health{Initialized: true, Version: "1.20.4"}, Latency: 280 * time.Millisecond}
 	m.rows[0].probing = false
-	m.rows[1].Status.Result = probe.Result{Err: &probe.NotVaultError{Status: 403, ContentType: "text/html"}}
+	blocked, err := probe.TargetFor([]string{"VAULT_ADDR=" + vaulttest.Serve(t, vaulttest.Forbidden())})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.rows[1].Status.Result = probe.Probe(t.Context(), blocked, nil, time.Second)
 	m.rows[1].probing = false
 	return m, b
 }

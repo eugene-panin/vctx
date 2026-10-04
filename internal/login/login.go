@@ -1,5 +1,6 @@
-// Package login makes sure a context has a working Vault token, logging in
-// with the Vault CLI when it has none. vault asks for the credential itself.
+// Package login logs in to a context with the Vault CLI when it has no working token.
+//
+// vault itself asks for the credential; vctx keeps no secret.
 package login
 
 import (
@@ -18,11 +19,10 @@ import (
 	"strings"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/eugene-panin/vctx/internal/atomicfile"
 	"github.com/eugene-panin/vctx/internal/config"
 	"github.com/eugene-panin/vctx/internal/environ"
 	"github.com/eugene-panin/vctx/internal/probe"
+	"github.com/eugene-panin/vctx/internal/safefile"
 	"github.com/eugene-panin/vctx/internal/style"
 	"github.com/eugene-panin/vctx/internal/termsafe"
 	"github.com/eugene-panin/vctx/internal/token"
@@ -299,7 +299,7 @@ func (r *Runner) helperEnv(cfg *config.Config, name string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := environ.RegisterHelper(vars, r.StateDir, r.Self); err != nil {
+	if err := token.RegisterHelper(vars, r.StateDir, r.Self); err != nil {
 		return nil, err
 	}
 	return environ.Apply(r.Environ, vars), nil
@@ -316,7 +316,7 @@ func (r *Runner) login(ctx context.Context, cfg *config.Config, name, reason str
 
 	args, fromConfig := cfg.Login(name), true
 	if args == nil {
-		args, fromConfig = r.Remembered(name), false
+		args, fromConfig = r.remembered(name), false
 	}
 	asked := false
 	if args == nil {
@@ -335,7 +335,7 @@ func (r *Runner) login(ctx context.Context, cfg *config.Config, name, reason str
 		switch {
 		case err == nil:
 			if asked {
-				if err := r.Remember(name, args); err != nil {
+				if err := r.remember(name, args); err != nil {
 					fmt.Fprintln(out, p.Warn.Render("  could not remember the login method: "+err.Error()))
 				}
 			}
@@ -439,13 +439,14 @@ func askLogin(ans *answers, out io.Writer, user string) ([]string, error) {
 	return config.NormalizeLoginArgs(args)
 }
 
-// RememberedPath keeps the login answers for context name: not secrets.
-func (r *Runner) RememberedPath(name string) string {
+// rememberedPath keeps the login answers for context name: not secrets.
+func (r *Runner) rememberedPath(name string) string {
 	return filepath.Join(r.StateDir, "login", name+".json")
 }
 
-func (r *Runner) Remembered(name string) []string {
-	b, err := os.ReadFile(r.RememberedPath(name))
+// remembered is the login method answered for context name, nil when none was.
+func (r *Runner) remembered(name string) []string {
+	b, err := os.ReadFile(r.rememberedPath(name))
 	if err != nil {
 		return nil
 	}
@@ -460,26 +461,27 @@ func (r *Runner) Remembered(name string) []string {
 	return args
 }
 
-// For is the login method of context name: from the config, else the
+// Method is the login method of context name: from the config, else the
 // remembered answers; nil when there is neither.
-func (r *Runner) For(cfg *config.Config, name string) []string {
+func (r *Runner) Method(cfg *config.Config, name string) []string {
 	if args := cfg.Login(name); args != nil {
 		return args
 	}
-	return r.Remembered(name)
+	return r.remembered(name)
 }
 
-func (r *Runner) Remember(name string, args []string) error {
+// remember keeps args as the login method of context name.
+func (r *Runner) remember(name string, args []string) error {
 	b, err := json.Marshal(args)
 	if err != nil {
 		return err
 	}
-	return atomicfile.Write(r.RememberedPath(name), b, 0o600)
+	return safefile.Write(r.rememberedPath(name), b, 0o600)
 }
 
-// loginExec runs login under the UI as a tea.ExecCommand, so the UI hands the
-// terminal over for the questions and vault's own prompts.
-type loginExec struct {
+// Cmd is a login run under the UI, which hands the terminal over for the
+// questions and vault's own prompts; it fits tea.ExecCommand.
+type Cmd struct {
 	r    *Runner
 	cfg  *config.Config
 	name string
@@ -487,12 +489,12 @@ type loginExec struct {
 	out  io.Writer
 }
 
-func (l *loginExec) SetStdin(r io.Reader)  { l.in = r }
-func (l *loginExec) SetStdout(w io.Writer) { l.out = w }
-func (l *loginExec) SetStderr(io.Writer)   {}
+func (l *Cmd) SetStdin(r io.Reader)  { l.in = r }
+func (l *Cmd) SetStdout(w io.Writer) { l.out = w }
+func (l *Cmd) SetStderr(io.Writer)   {}
 
 // Run waits for Enter after a failure, so vault's message is read before the UI covers it.
-func (l *loginExec) Run() error {
+func (l *Cmd) Run() error {
 	ctx, stop := Interruptible()
 	defer stop()
 	env, err := l.r.helperEnv(l.cfg, l.name)
@@ -508,7 +510,7 @@ func (l *loginExec) Run() error {
 	return err
 }
 
-// Exec returns the login for context name as a tea.ExecCommand, for the UI.
-func (r *Runner) Exec(cfg *config.Config, name string) tea.ExecCommand {
-	return &loginExec{r: r, cfg: cfg, name: name}
+// Cmd returns the login for context name, for the UI.
+func (r *Runner) Cmd(cfg *config.Config, name string) *Cmd {
+	return &Cmd{r: r, cfg: cfg, name: name}
 }

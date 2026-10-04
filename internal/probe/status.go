@@ -1,6 +1,4 @@
-// Package status describes the contexts vctx knows: what each resolves to,
-// and what a probe found.
-package status
+package probe
 
 import (
 	"context"
@@ -10,7 +8,6 @@ import (
 
 	"github.com/eugene-panin/vctx/internal/config"
 	"github.com/eugene-panin/vctx/internal/environ"
-	"github.com/eugene-panin/vctx/internal/probe"
 	"github.com/eugene-panin/vctx/internal/termsafe"
 )
 
@@ -20,7 +17,7 @@ type Status struct {
 	Endpoint string // host:port vctx connects to, and the proxy if any
 	Display  string
 	Unix     bool
-	probe.Result
+	Result
 }
 
 // Level grades a status for display.
@@ -38,7 +35,7 @@ func (s Status) Summary() (string, Level) {
 	case s.Err == nil && s.Health == nil:
 		return "checking", Warn
 	case s.Err != nil:
-		_, long := probe.Classify(s.Err)
+		_, long := Classify(s.Err)
 		return long, Fail
 	case !s.Health.Usable():
 		return s.Health.String(), Warn
@@ -49,7 +46,7 @@ func (s Status) Summary() (string, Level) {
 // Short is Summary with a compact label for errors.
 func (s Status) Short() (string, Level) {
 	if s.Err != nil {
-		short, _ := probe.Classify(s.Err)
+		short, _ := Classify(s.Err)
 		return short, Fail
 	}
 	return s.Summary()
@@ -63,26 +60,27 @@ func (s Status) LatencyText() string {
 	return fmt.Sprintf("%dms", max(s.Latency.Milliseconds(), 1))
 }
 
-// Context is a context resolved once: what to probe, and the variables to
-// run commands with (after environ.RegisterHelper adds the token helper).
-type Context struct {
+// Instance is the Vault instance of a context, resolved once: what to probe,
+// and the variables to run commands with (after token.RegisterHelper adds
+// the token helper).
+type Instance struct {
 	Status Status
 	Vars   map[string]string // environ.ContextVars: as configured, plus vctx bookkeeping
 	Env    []string          // environment for probing
-	Target probe.Target
+	Target Target
 	// The address could not be resolved: Status.Err says why, and there is nothing to probe.
 	BadAddr bool
 }
 
-// Prepare resolves context name over osEnv. An address vctx cannot use ends
+// Resolve resolves context name over osEnv. An address vctx cannot use ends
 // up in the status, so one bad context does not hide the others.
-func Prepare(cfg *config.Config, name string, osEnv []string, home string) (Context, error) {
+func Resolve(cfg *config.Config, name string, osEnv []string, home string) (Instance, error) {
 	vars, err := environ.ContextVars(cfg, name, home)
 	if err != nil {
-		return Context{}, err
+		return Instance{}, err
 	}
-	c := Context{Status: Status{Name: name}, Vars: vars, Env: environ.Apply(osEnv, vars)}
-	if c.Target, err = probe.TargetFor(c.Env); err != nil {
+	c := Instance{Status: Status{Name: name}, Vars: vars, Env: environ.Apply(osEnv, vars)}
+	if c.Target, err = TargetFor(c.Env); err != nil {
 		c.Status.Display = termsafe.String(config.RedactAddr(config.VaultAddr(vars)), 60)
 		c.Status.Endpoint = c.Status.Display
 		c.Status.Err = err
@@ -93,13 +91,13 @@ func Prepare(cfg *config.Config, name string, osEnv []string, home string) (Cont
 	return c, nil
 }
 
-// Probe checks c's instance.
-func (c *Context) Probe(timeout time.Duration) probe.Result {
-	return probe.Probe(context.Background(), c.Target, c.Env, timeout)
+// Probe checks the instance.
+func (c *Instance) Probe(timeout time.Duration) Result {
+	return Probe(context.Background(), c.Target, c.Env, timeout)
 }
 
-// ProbeAll probes, concurrently, every context whose address could be resolved.
-func ProbeAll(cs []Context, timeout time.Duration) {
+// All probes, concurrently, every instance whose address could be resolved.
+func All(cs []Instance, timeout time.Duration) {
 	var wg sync.WaitGroup
 	for i := range cs {
 		if !cs[i].BadAddr {

@@ -1,5 +1,4 @@
-// Package cli is vctx's command line: it parses the command, and wires the
-// other packages together for it.
+// Package cli parses vctx's command line and wires the other packages together.
 package cli
 
 import (
@@ -15,10 +14,10 @@ import (
 	"syscall"
 	"text/tabwriter"
 
-	"github.com/eugene-panin/vctx/internal/atomicfile"
 	"github.com/eugene-panin/vctx/internal/config"
 	"github.com/eugene-panin/vctx/internal/environ"
 	"github.com/eugene-panin/vctx/internal/login"
+	"github.com/eugene-panin/vctx/internal/safefile"
 	"github.com/eugene-panin/vctx/internal/shell"
 	"github.com/eugene-panin/vctx/internal/token"
 )
@@ -164,7 +163,7 @@ func newApp() (*app, error) {
 	// On macOS os.Executable keeps the path as invoked: a package manager's symlink
 	// survives upgrades, the versioned file it points to does not. (Linux reads
 	// /proc/self/exe, already resolved.) Resolve only if the path is unusable.
-	if !environ.HelperPathOK(self) {
+	if !token.HelperPathOK(self) {
 		if p, err := filepath.EvalSymlinks(self); err == nil {
 			self = p
 		}
@@ -241,6 +240,10 @@ func (a *app) run(args []string) error {
 		if err != nil {
 			return err
 		}
+		timeout, err := a.checkTimeout()
+		if err != nil {
+			return err
+		}
 		ctx, stop := login.Interruptible()
 		defer stop()
 		if err := a.use(cfg, rest[0]); err != nil {
@@ -248,7 +251,7 @@ func (a *app) run(args []string) error {
 		}
 		shell.Announce(a.environ, rest[0])
 		a.printUsing(rest[0], cfg)
-		a.ensureLogin(ctx, cfg, rest[0])
+		a.loginRunner(timeout).Ensure(ctx, cfg, rest[0])
 		return nil
 	case "current":
 		if len(rest) > 0 {
@@ -360,12 +363,26 @@ func (a *app) vaultBin() string {
 	return "vault"
 }
 
+// commands are the subcommands run dispatches on, token helper operations
+// included. Context names double as subcommands ("vctx prod ..."), so they
+// must not shadow these.
+var commands = []string{"help", "-h", "--help", "version", "--version", "ui", "ls", "list", "use", "current",
+	"env", "exec", "init", "check", "logout", "get", "store", "erase"}
+
 func (a *app) loadConfig() (*config.Config, error) {
 	cfg, err := config.Load(a.configPath)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, fmt.Errorf("no config at %s: create it, the format is in 'vctx help'", a.configPath)
 	}
-	return cfg, err
+	if err != nil {
+		return nil, err
+	}
+	for _, name := range slices.Sorted(maps.Keys(cfg.Contexts)) {
+		if slices.Contains(commands, name) {
+			return nil, fmt.Errorf("%s: context name %q is a vctx command", a.configPath, name)
+		}
+	}
+	return cfg, nil
 }
 
 func (a *app) currentFile() string {
@@ -445,7 +462,7 @@ func (a *app) use(cfg *config.Config, name string) error {
 	if _, ok := cfg.Contexts[name]; !ok {
 		return fmt.Errorf("unknown context %q", name)
 	}
-	if err := atomicfile.Write(a.currentFile(), []byte(name+"\n"), 0o600); err != nil {
+	if err := safefile.Write(a.currentFile(), []byte(name+"\n"), 0o600); err != nil {
 		return fmt.Errorf("save current context: %w", err)
 	}
 	return nil
@@ -506,7 +523,7 @@ func (a *app) env(args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := environ.RegisterHelper(vars, a.stateDir, a.self); err != nil {
+	if err := token.RegisterHelper(vars, a.stateDir, a.self); err != nil {
 		return err
 	}
 	write(a.stdout, a.environ, vars)
@@ -535,7 +552,7 @@ func (a *app) execWith(cfg *config.Config, name string, argv []string) error {
 	if err != nil {
 		return err
 	}
-	if err := environ.RegisterHelper(vars, a.stateDir, a.self); err != nil {
+	if err := token.RegisterHelper(vars, a.stateDir, a.self); err != nil {
 		return err
 	}
 	env := environ.Apply(a.environ, vars)

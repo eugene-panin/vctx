@@ -2,7 +2,6 @@ package cli
 
 import (
 	"crypto/tls"
-	"encoding/pem"
 	"io"
 	"log"
 	"net/http"
@@ -12,19 +11,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/eugene-panin/vctx/internal/probe"
 	"github.com/eugene-panin/vctx/internal/vaulttest"
 )
-
-// probeEnv probes the target env resolves to, as vctx does before running vault.
-func probeEnv(t *testing.T, env []string) probe.Result {
-	t.Helper()
-	tg, err := probe.TargetFor(env)
-	if err != nil {
-		return probe.Result{Err: err}
-	}
-	return probe.Probe(t.Context(), tg, env, probe.DefaultTimeout)
-}
 
 func writeContexts(t *testing.T, a *app, addrs map[string]string) {
 	t.Helper()
@@ -83,39 +71,17 @@ func TestCheckDisabled(t *testing.T) {
 	}
 }
 
-func TestTLS(t *testing.T) {
+// An untrusted certificate is left for vault to report, so the command still runs.
+func TestUntrustedCertLeftToVault(t *testing.T) {
 	srv := httptest.NewUnstartedServer(vaulttest.Handler(200, vaulttest.ActiveBody))
 	srv.Config.ErrorLog = log.New(io.Discard, "", 0)
 	srv.StartTLS()
 	t.Cleanup(srv.Close)
-	caFile := filepath.Join(t.TempDir(), "ca.pem")
-	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw})
-	if err := os.WriteFile(caFile, pemBytes, 0o600); err != nil {
-		t.Fatal(err)
-	}
 
-	env := []string{"VAULT_ADDR=" + srv.URL}
-	if r := probeEnv(t, env); !probe.IsTLSError(r.Err) {
-		t.Errorf("without CA: err = %v, want a TLS verification error", r.Err)
-	}
-	if r := probeEnv(t, append(env, "VAULT_CACERT="+caFile)); r.Err != nil {
-		t.Errorf("with VAULT_CACERT: %v", r.Err)
-	}
-	if r := probeEnv(t, append(env, "VAULT_SKIP_VERIFY=true")); r.Err != nil {
-		t.Errorf("with VAULT_SKIP_VERIFY: %v", r.Err)
-	}
-
-	// An untrusted certificate is left for vault to report, so the command still runs.
 	a, _, call := newTestApp(t, "VCTX_CHECK_TIMEOUT=2s")
 	writeContexts(t, a, map[string]string{"x": srv.URL})
 	if err := a.run([]string{"x", "status"}); err != nil || call.argv0 == "" {
 		t.Fatalf("err = %v, ran = %v", err, call.argv0 != "")
-	}
-
-	plain := vaulttest.Serve(t, vaulttest.Handler(200, vaulttest.ActiveBody))
-	r := probeEnv(t, []string{"VAULT_ADDR=" + strings.Replace(plain, "http://", "https://", 1)})
-	if _, got := probe.Classify(r.Err); !strings.Contains(got, "does not speak TLS") {
-		t.Errorf("https to plain http: %s", got)
 	}
 }
 
@@ -177,15 +143,6 @@ func TestTLSAlertLeftToVault(t *testing.T) {
 	srv.StartTLS()
 	t.Cleanup(srv.Close)
 
-	env := []string{"VAULT_ADDR=" + srv.URL, "VAULT_SKIP_VERIFY=true"}
-	r := probeEnv(t, env)
-	if !probe.IsTLSError(r.Err) || probe.NetworkProblem(r.Err) {
-		t.Fatalf("err = %v: tls %v, network %v", r.Err, probe.IsTLSError(r.Err), probe.NetworkProblem(r.Err))
-	}
-	if short, long := probe.Classify(r.Err); short != "tls error" || strings.Contains(long, "unreachable") || strings.Contains(long, "tls: tls:") {
-		t.Errorf("short %q, long %q", short, long)
-	}
-
 	a, _, call := newTestApp(t, "VCTX_CHECK_TIMEOUT=2s")
 	cfg := "contexts:\n  x:\n    VAULT_ADDR: " + srv.URL + "\n    VAULT_SKIP_VERIFY: \"true\"\n"
 	if err := os.WriteFile(a.configPath, []byte(cfg), 0o600); err != nil {
@@ -227,21 +184,15 @@ func TestBadProxyReported(t *testing.T) {
 	}
 }
 
-func TestUnhealthyNodesAreVault(t *testing.T) {
+func TestUnhealthyNodesRunVault(t *testing.T) {
 	for _, tc := range []struct {
 		status int
 		body   string
-		want   string
-		usable bool
 	}{
-		{474, `{"initialized":true,"sealed":false,"standby":true,"version":"1.20.4"}`, "1.20.4 standby", true},
-		{530, `{"initialized":true,"sealed":false,"standby":true,"removed_from_cluster":true,"version":"1.20.4"}`, "1.20.4 removed from cluster", false},
+		{474, `{"initialized":true,"sealed":false,"standby":true,"version":"1.20.4"}`},
+		{530, `{"initialized":true,"sealed":false,"standby":true,"removed_from_cluster":true,"version":"1.20.4"}`},
 	} {
 		addr := vaulttest.Serve(t, vaulttest.Handler(tc.status, tc.body))
-		r := probeEnv(t, []string{"VAULT_ADDR=" + addr})
-		if r.Err != nil || r.Health.String() != tc.want || r.Health.Usable() != tc.usable {
-			t.Errorf("HTTP %d: err %v, health %+v", tc.status, r.Err, r.Health)
-		}
 		a, _, call := newTestApp(t, "VCTX_CHECK_TIMEOUT=2s")
 		writeContexts(t, a, map[string]string{"x": addr})
 		if err := a.run([]string{"x", "status"}); err != nil || call.argv0 == "" {

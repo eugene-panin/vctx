@@ -28,16 +28,16 @@ func Key(env []string) string {
 	get := func(k string) string { return environ.Value(env, k) }
 	name, ctxAddr := get(environ.Context), get(environ.ContextAddr)
 	ownContext := ctxAddr == "" ||
-		ctxAddr == CallerAddr(env) && get(environ.ContextNS) == get("VAULT_NAMESPACE")
+		ctxAddr == callerAddr(env) && get(environ.ContextNS) == get("VAULT_NAMESPACE")
 	if config.ValidName(name) && ownContext {
 		return name
 	}
-	sum := sha256.Sum256([]byte(CallerAddr(env) + "\x00" + get("VAULT_NAMESPACE")))
+	sum := sha256.Sum256([]byte(callerAddr(env) + "\x00" + get("VAULT_NAMESPACE")))
 	return "_addr/" + hex.EncodeToString(sum[:12])
 }
 
-// CallerAddr is the address the vault process running with env talks to.
-func CallerAddr(env []string) string {
+// callerAddr is the address the vault process running with env talks to.
+func callerAddr(env []string) string {
 	addr, _ := config.AddrFrom(func(k string) string { return environ.Value(env, k) })
 	return config.NormalizeAddr(addr)
 }
@@ -55,7 +55,7 @@ func Helper(op string, env []string, s Store, in io.Reader, out io.Writer) error
 	switch op {
 	case "get":
 		token, addr, ok, err := s.Get(key)
-		if err != nil || !ok || addr != CallerAddr(env) {
+		if err != nil || !ok || addr != callerAddr(env) {
 			return err
 		}
 		_, err = io.WriteString(out, token)
@@ -73,7 +73,7 @@ func Helper(op string, env []string, s Store, in io.Reader, out io.Writer) error
 		if token == "" {
 			return s.Del(key)
 		}
-		return s.Set(key, token, CallerAddr(env))
+		return s.Set(key, token, callerAddr(env))
 	case "erase":
 		return s.Del(key)
 	}

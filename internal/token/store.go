@@ -1,5 +1,4 @@
-// Package token stores Vault tokens per context, bound to the address they
-// were issued for, and speaks Vault's token helper protocol.
+// Package token stores Vault tokens bound to their address, as Vault's token helper.
 package token
 
 import (
@@ -12,8 +11,8 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/eugene-panin/vctx/internal/atomicfile"
 	"github.com/eugene-panin/vctx/internal/config"
+	"github.com/eugene-panin/vctx/internal/safefile"
 	"github.com/zalando/go-keyring"
 )
 
@@ -22,9 +21,9 @@ const keyringService = "vctx"
 // Store keeps one token per key, with the address it was issued for;
 // keys are context names or "_addr/<hash>".
 type Store interface {
-	// get returns the token stored for key and its address; ok is false when there is none.
+	// Get returns the token stored for key and its address; ok is false when there is none.
 	Get(key string) (token, addr string, ok bool, err error)
-	// addr is get without the token, where the store can avoid reading the secret.
+	// Addr is Get without the token, where the store can avoid reading the secret.
 	Addr(key string) (addr string, ok bool, err error)
 	Set(key, token, addr string) error
 	Del(key string) error
@@ -65,7 +64,7 @@ func (s fileStore) Addr(key string) (string, bool, error) {
 }
 
 func (s fileStore) Set(key, token, addr string) error {
-	return atomicfile.Write(s.path(key), []byte(encodeToken(token, addr)), 0o600)
+	return safefile.Write(s.path(key), []byte(encodeToken(token, addr)), 0o600)
 }
 
 func (s fileStore) Del(key string) error {
@@ -120,7 +119,7 @@ func keychainError(err error) error {
 // keychainStore keeps tokens in the OS keychain and, in plain files under
 // addrDir, the address of each, so status needs no secret read. A token file
 // written by an earlier version is still read; the next login moves it here,
-// as set removes it. Reads never write.
+// as Set removes it. Reads never write.
 type keychainStore struct {
 	kr      SecretService
 	addrDir string
@@ -173,17 +172,17 @@ func (s keychainStore) Addr(key string) (string, bool, error) {
 	return addr, ok, err
 }
 
-// set records the address first and puts the old record back if the keychain
+// Set records the address first and puts the old record back if the keychain
 // refuses the token, so the record never describes a token that is not there.
 func (s keychainStore) Set(key, token, addr string) error {
 	path := s.addrPath(key)
 	old, oldErr := os.ReadFile(path)
-	if err := atomicfile.Write(path, []byte(addr+"\n"), 0o600); err != nil {
+	if err := safefile.Write(path, []byte(addr+"\n"), 0o600); err != nil {
 		return err
 	}
 	if err := s.kr.Set(keyringService, key, encodeToken(token, addr)); err != nil {
 		if oldErr == nil {
-			_ = atomicfile.Write(path, old, 0o600)
+			_ = safefile.Write(path, old, 0o600)
 		} else {
 			_ = os.Remove(path)
 		}

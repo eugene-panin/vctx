@@ -5,8 +5,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-
-	"github.com/eugene-panin/vctx/internal/environ"
 )
 
 func TestEnvDefaultIgnoresShellContext(t *testing.T) {
@@ -32,9 +30,6 @@ func TestFishEnv(t *testing.T) {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("missing %q:\n%s", want, out)
 		}
-	}
-	if got := environ.FishQuote(`it's \ here`); got != `'it\'s \\ here'` {
-		t.Errorf("fishQuote = %s", got)
 	}
 }
 
