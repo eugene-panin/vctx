@@ -669,3 +669,66 @@ func TestTokenTooLarge(t *testing.T) {
 		t.Errorf("a cut token was stored: %v", err)
 	}
 }
+
+// The variables vault runs with bind tokens to the context: a login through
+// vctx lands under the context's name and shows as ok.
+func TestContextBindingEndToEnd(t *testing.T) {
+	a, out, call := newTestApp(t)
+	cfg := "contexts:\n  dev:\n    VAULT_ADDR: http://127.0.0.1:8201/\n    VAULT_NAMESPACE: admin\n"
+	if err := os.WriteFile(a.configPath, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.run([]string{"dev", "login"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, kv := range []string{"VCTX_CONTEXT_ADDR=http://127.0.0.1:8201", "VCTX_CONTEXT_NAMESPACE=admin"} {
+		if !slices.Contains(call.env, kv) {
+			t.Errorf("vault env lacks %s", kv)
+		}
+	}
+	a.environ = call.env // what the token helper sees when vault runs it
+	helperRunner(t, a, out)("store", "tok")
+	if got, err := a.tokenStatus(loadTestConfig(t, a), []string{"dev"}); err != nil || got["dev"] != tokenOK {
+		t.Errorf("status after login = %v, %v", got, err)
+	}
+
+	out.Reset()
+	if err := a.run([]string{"env", "--clear"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{"VCTX_CONTEXT_ADDR", "VCTX_CONTEXT_NAMESPACE"} {
+		if !strings.Contains(out.String(), "unset "+k+"\n") {
+			t.Errorf("--clear keeps %s:\n%s", k, out)
+		}
+	}
+}
+
+func TestHandChangedNamespaceKeepsContextToken(t *testing.T) {
+	a, out, _ := newTestApp(t)
+	helper := helperRunner(t, a, out)
+	ctx := []string{"VCTX_CONTEXT=dev", "VCTX_CONTEXT_ADDR=http://v", "VCTX_CONTEXT_NAMESPACE=admin", "VAULT_ADDR=http://v"}
+	helper("store", "admin-token", append(ctx, "VAULT_NAMESPACE=admin")...)
+	helper("store", "team-token", append(ctx, "VAULT_NAMESPACE=admin/team")...)
+	if got := helper("get", "", append(ctx, "VAULT_NAMESPACE=admin")...); got != "admin-token" {
+		t.Errorf("context token = %q", got)
+	}
+}
+
+func TestLogoutInContextShellForgetsVaultsToken(t *testing.T) {
+	a, out, _ := newTestApp(t)
+	helper := helperRunner(t, a, out)
+	ctx := []string{"VCTX_CONTEXT=dev", "VCTX_CONTEXT_ADDR=http://127.0.0.1:8201"}
+	helper("store", "dev-token", append(ctx, "VAULT_ADDR=http://127.0.0.1:8201")...)
+	helper("store", "other-token", append(ctx, "VAULT_ADDR=http://other")...)
+
+	a.environ = withEnv(a.environ, append(ctx, "VAULT_ADDR=http://other")...)
+	if err := a.run([]string{"logout"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := helper("get", "", append(ctx, "VAULT_ADDR=http://other")...); got != "" {
+		t.Errorf("token vault uses is still there: %q", got)
+	}
+	if got := helper("get", "", append(ctx, "VAULT_ADDR=http://127.0.0.1:8201")...); got != "dev-token" {
+		t.Errorf("context token = %q", got)
+	}
+}

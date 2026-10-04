@@ -257,4 +257,11 @@ func TestOldAddressRecordsRemoved(t *testing.T) {
 	if _, err := os.Stat(old); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("old record left after store: %v", err)
 	}
+	if err := writeFileAtomic(old, []byte("http://stale\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	helper("erase", "", "VCTX_CONTEXT=dev", "VAULT_ADDR=http://127.0.0.1:8201")
+	if _, err := os.Stat(old); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("old record left after erase: %v", err)
+	}
 }

@@ -573,3 +573,10 @@ func TestProxyStatusCodes(t *testing.T) {
 		}
 	}
 }
+
+func TestProxyGatewayErrorForPlainHTTP(t *testing.T) {
+	r := probeEnv(t, []string{"VAULT_ADDR=http://vault.example.com", "VAULT_PROXY_ADDR=" + rawProxy(t, "504 Gateway Time-out")})
+	if short, long := classify(r.err); short != "proxy can't reach" || !networkProblem(r.err) {
+		t.Errorf("short %q, long %q", short, long)
+	}
+}

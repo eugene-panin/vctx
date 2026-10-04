@@ -363,6 +363,12 @@ func probe(ctx context.Context, t target, env []string, timeout time.Duration) p
 	if resp.StatusCode == http.StatusBadRequest && bytes.Contains(body, []byte("HTTP request to an HTTPS server")) {
 		return probeResult{err: &configError{errors.New("the server speaks TLS: use https:// in the address")}}
 	}
+	// For an http:// address the proxy forwards the request instead of opening
+	// a tunnel, so its own gateway errors arrive as ordinary responses.
+	if pe := (&proxyError{code: resp.StatusCode}); t.proxy != nil && t.addr.Scheme == "http" && pe.upstream() {
+		pe.proxy, pe.status = t.proxy.Host, sanitize(resp.Status, 60)
+		return probeResult{err: pe}
+	}
 	notVault := &notVaultError{status: resp.StatusCode, contentType: sanitize(resp.Header.Get("Content-Type"), 40)}
 	if notVault.contentType == "" {
 		notVault.contentType = "no content type"

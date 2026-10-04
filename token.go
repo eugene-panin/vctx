@@ -18,12 +18,15 @@ func isHelperOp(s string) bool {
 // vault was started through vctx, otherwise by address and namespace. The "_"
 // prefix cannot start a context name, so the two kinds of keys never collide.
 //
-// In a shell set up with `vctx env`, VAULT_ADDR changed by hand points vault
-// away from the context; its token then goes under the address key, so it
-// neither replaces nor erases the context's own.
+// In a shell set up with `vctx env`, VAULT_ADDR or VAULT_NAMESPACE changed by
+// hand points vault away from the context; its token then goes under the
+// address key, so it neither replaces nor erases the context's own. Shells set
+// up by a vctx without VCTX_CONTEXT_ADDR always use the context name.
 func (a *app) tokenKey() string {
 	name, ctxAddr := a.getenv(envContext), a.getenv(envContextAddr)
-	if nameRe.MatchString(name) && (ctxAddr == "" || ctxAddr == a.callerAddr()) {
+	ownContext := ctxAddr == "" ||
+		ctxAddr == a.callerAddr() && a.getenv(envContextNS) == a.getenv("VAULT_NAMESPACE")
+	if nameRe.MatchString(name) && ownContext {
 		return name
 	}
 	sum := sha256.Sum256([]byte(a.callerAddr() + "\x00" + a.getenv("VAULT_NAMESPACE")))

@@ -15,9 +15,11 @@ import (
 
 const (
 	envContext = "VCTX_CONTEXT"
-	// envContextAddr is the active context's address, so the token helper can
-	// tell vault pointed elsewhere by hand from vault talking to the context.
+	// envContextAddr and envContextNS are the active context's address and
+	// namespace, so the token helper can tell vault pointed elsewhere by hand
+	// from vault talking to the context.
 	envContextAddr = "VCTX_CONTEXT_ADDR"
+	envContextNS   = "VCTX_CONTEXT_NAMESPACE"
 	// envManaged lists non-VAULT_ variables the active context set, so switching
 	// away from it can drop them or give back the values they replaced.
 	envManaged = "VCTX_VARS"
@@ -61,6 +63,7 @@ func (a *app) contextVars(cfg *config, name string) (map[string]string, error) {
 	}
 	vars[envContext] = name
 	vars[envContextAddr] = normalizeAddr(vaultAddr(vars))
+	vars[envContextNS] = vars["VAULT_NAMESPACE"]
 	return vars, nil
 }
 
@@ -96,7 +99,7 @@ func planEnv(environ []string, vars map[string]string) envPlan {
 	for _, kv := range environ {
 		k, v, _ := strings.Cut(kv, "=")
 		switch {
-		case strings.HasPrefix(k, "VAULT_"), k == envContext, k == envContextAddr:
+		case strings.HasPrefix(k, "VAULT_"), k == envContext, k == envContextAddr, k == envContextNS:
 			drop[k] = true
 		case k == envManaged:
 			drop[k] = true

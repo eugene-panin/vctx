@@ -82,8 +82,9 @@ type model struct {
 	flashOK bool
 	chosen  string
 	// Loaded in the background: with the keychain every lookup runs a process.
-	tokens   map[string]tokenState
-	tokenGen int // bumped per load, and on forget, so a late answer is ignored
+	tokens       map[string]tokenState
+	tokensLoaded bool
+	tokenGen     int // bumped per load, and on forget, so a late answer is ignored
 }
 
 func newModel(a *app, cfg *config) (*model, error) {
@@ -203,7 +204,7 @@ func (m *model) update(msg tea.Msg) tea.Cmd {
 		if msg.gen != m.tokenGen {
 			return nil
 		}
-		m.tokens = msg.tokens
+		m.tokens, m.tokensLoaded = msg.tokens, true
 		if msg.err != nil {
 			m.setFlash("token status: "+msg.err.Error(), false)
 		}
@@ -256,7 +257,7 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		}
 		return m.run(m.cursor, "shell", sh)
 	case key.Matches(msg, keys.Logout):
-		if m.tokens[r.status.name] == tokenNone {
+		if m.tokensLoaded && m.tokens[r.status.name] == tokenNone {
 			m.setFlash(r.status.name+": no stored token", false)
 			return nil
 		}
@@ -423,11 +424,13 @@ func (m *model) tableView(width, height int) string {
 }
 
 // displayValue hides secrets in a variable shown on screen: values of
-// token, secret and password variables, and credentials inside URLs.
+// variables named like credentials, and credentials inside URLs.
 func displayValue(key, value string) string {
 	k := strings.ToUpper(key)
-	if strings.Contains(k, "TOKEN") || strings.Contains(k, "SECRET") || strings.Contains(k, "PASSWORD") {
-		return "•••"
+	for _, word := range []string{"TOKEN", "SECRET", "PASS", "CREDENTIAL", "KEY"} {
+		if strings.Contains(k, word) {
+			return "•••"
+		}
 	}
 	if strings.Contains(value, "://") {
 		return redactAddr(value)

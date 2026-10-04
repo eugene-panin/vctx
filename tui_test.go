@@ -163,6 +163,9 @@ func TestDisplayValue(t *testing.T) {
 		{"DB_PASSWORD", "x", "•••"},
 		{"HTTPS_PROXY", "http://user:pass@proxy:3128", "http://user:xxxxx@proxy:3128"},
 		{"VAULT_NAMESPACE", "admin", "admin"},
+		{"API_KEY", "k", "•••"},
+		{"SMTP_PASS", "p", "•••"},
+		{"GOOGLE_APPLICATION_CREDENTIALS", "/k.json", "•••"},
 	}
 	for _, tc := range tests {
 		if got := displayValue(tc.key, tc.value); got != tc.want {
@@ -323,5 +326,20 @@ func TestMultilineValueInDetails(t *testing.T) {
 	view := m.View()
 	if !strings.Contains(view, "VAULT_CACERT_BYTES=-----BEGIN CERTIFICATE-----…") || strings.Contains(view, "MIIB") {
 		t.Errorf("details:\n%s", view)
+	}
+}
+
+func TestForgetBeforeStatusLoads(t *testing.T) {
+	m, a := newTestModel(t)
+	if err := writeFileAtomic(a.tokenPath("dev"), []byte("http://127.0.0.1:8201\nt\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
+	if cmd == nil {
+		t.Fatalf("x refused before token status loaded: %q", m.flash)
+	}
+	m.Update(cmd())
+	if _, err := os.Stat(a.tokenPath("dev")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("token not forgotten: %v", err)
 	}
 }

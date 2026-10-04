@@ -28,7 +28,8 @@ Usage:
   vctx current                     print the active context
   vctx ls                          list contexts
   vctx check [<context>...]        show reachability, version and seal status
-  vctx logout [<context>]          forget the stored token of <context>
+  vctx logout [<context>]          forget the stored token of <context>, or
+                                   in a context shell the one vault uses
 
 The context is taken from the explicit name, then $VCTX_CONTEXT,
 then the default set by 'vctx use'.
@@ -48,7 +49,8 @@ Config: $VCTX_CONFIG or $XDG_CONFIG_HOME/vctx/config.yaml (~/.config by default)
 
 Before running a command vctx calls the unauthenticated sys/health endpoint,
 so a VPN or tunnel that is down, or an ingress rejecting your IP, fails in
-seconds. VCTX_CHECK_TIMEOUT sets the timeout (default 3s), 0 disables it.
+seconds. VCTX_CHECK_TIMEOUT sets the timeout (default 3s); 0 skips the check
+before commands, while 'vctx check' and the UI still probe, with 3s.
 
 Inherited VAULT_* variables are dropped before a context is applied, so an
 address or token of one instance never leaks into another. vctx refuses vault's
@@ -72,10 +74,11 @@ Environment:
   VCTX_CONFIG         config file
   VCTX_STATE_DIR      tokens, default context, generated Vault config
   VCTX_TOKEN_STORE    file or keychain
-  VCTX_CHECK_TIMEOUT  reachability check timeout, 0 disables it
+  VCTX_CHECK_TIMEOUT  reachability check timeout, 0 skips it before commands
   VCTX_VAULT_BIN      vault binary to run (default: vault on PATH)
-  VCTX_CONTEXT        set by 'vctx env': this shell's context (and
-                      VCTX_CONTEXT_ADDR, VCTX_VARS, VCTX_SAVED_*)
+  VCTX_CONTEXT        set for vault and in a 'vctx env' shell: the context
+                      (with VCTX_CONTEXT_ADDR, VCTX_CONTEXT_NAMESPACE,
+                      VCTX_VARS, VCTX_SAVED_*)
 `
 
 type app struct {
@@ -231,6 +234,18 @@ func (a *app) run(args []string) error {
 		if len(rest) > 1 || len(rest) == 1 && strings.HasPrefix(rest[0], "-") {
 			return usageError("usage: vctx logout [<context>]")
 		}
+		store, err := a.tokens()
+		if err != nil {
+			return err
+		}
+		// In a context shell, forget the token vault would use there, which
+		// may be an address key if VAULT_ADDR was changed by hand.
+		if len(rest) == 0 && a.getenv(envContext) != "" {
+			if _, err := a.contextName(""); err != nil {
+				return err
+			}
+			return store.del(a.tokenKey())
+		}
 		var arg string
 		if len(rest) == 1 {
 			arg = rest[0]
@@ -240,10 +255,6 @@ func (a *app) run(args []string) error {
 			return err
 		}
 		cfg, err := a.loadConfig()
-		if err != nil {
-			return err
-		}
-		store, err := a.tokens()
 		if err != nil {
 			return err
 		}
