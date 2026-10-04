@@ -249,7 +249,8 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		m.flash = ""
 		return m.refresh()
 	case key.Matches(msg, keys.Login):
-		return m.run(m.cursor, "login", m.a.vaultBin(), "login")
+		args := append([]string{"login", "-no-print"}, m.cfg.login(r.status.name)...)
+		return m.run(m.cursor, "login", m.a.vaultBin(), args...)
 	case key.Matches(msg, keys.Shell):
 		sh := m.a.getenv("SHELL")
 		if sh == "" {
@@ -469,6 +470,9 @@ func (m *model) detailView(width, height int) string {
 		b.WriteString(label("status") + m.p.level(lvl).Render(text) + m.p.dim.Render("  "+r.status.latencyText()) + "\n")
 	}
 
+	if args := m.cfg.login(r.status.name); args != nil {
+		b.WriteString(label("login") + m.p.dim.Render(truncate(strings.Join(args, " "), inner-8)) + "\n")
+	}
 	switch m.tokens[r.status.name] {
 	case tokenOK:
 		b.WriteString(label("token") + m.p.ok.Render("✓ stored") + "\n")
@@ -542,6 +546,7 @@ func (a *app) ui() error {
 	}
 	if m.chosen != "" {
 		a.printUsing(m.chosen, cfg)
+		a.ensureLogin(cfg, m.chosen)
 	}
 	return nil
 }

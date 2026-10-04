@@ -134,8 +134,18 @@ func checkPrivate(path string, fi fs.FileInfo) error {
 	return nil
 }
 
+// loginKey holds the arguments for `vault login`; unlike the other keys of a
+// context it is not an environment variable.
+const loginKey = "login"
+
 func checkVars(vars map[string]string) error {
 	for _, k := range slices.Sorted(maps.Keys(vars)) {
+		if k == loginKey {
+			if _, err := loginArgs(vars[k]); err != nil {
+				return fmt.Errorf("login: %w", err)
+			}
+			continue
+		}
 		if !envKeyRe.MatchString(k) {
 			return fmt.Errorf("invalid variable name %q", k)
 		}
@@ -159,7 +169,19 @@ func (c *config) vars(name, home string) (map[string]string, error) {
 	for k, v := range ctx {
 		out[k] = expandHome(v, home)
 	}
+	delete(out, loginKey)
 	return out, nil
+}
+
+// login returns the `vault login` arguments configured for context name, from
+// the context or the defaults; nil when none are.
+func (c *config) login(name string) []string {
+	v, ok := c.Contexts[name][loginKey]
+	if !ok {
+		v = c.Defaults[loginKey]
+	}
+	args, _ := loginArgs(v) // validated by loadConfig
+	return args
 }
 
 func expandHome(v, home string) string {

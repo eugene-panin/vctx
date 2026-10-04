@@ -26,7 +26,8 @@ Usage:
                                    switches the terminal and vault follows
   vctx env [<context>]             print exports: eval "$(vctx env prod)"
   vctx env --clear                 print commands that undo 'vctx env'
-  vctx use [<context>]             set the default context (UI without a name)
+  vctx use [<context>]             switch to <context>, logging in if needed
+                                   (the UI without a name)
   vctx current                     print the active context
   vctx ls                          list contexts
   vctx check [<context>...]        show reachability, version and seal status
@@ -44,10 +45,16 @@ Config: $VCTX_CONFIG or $XDG_CONFIG_HOME/vctx/config.yaml (~/.config by default)
     dev:
       VAULT_ADDR: https://vault.dev.example.com:8200
       VAULT_SKIP_VERIFY: "true"
+      login: -method=userpass username=me
     prod:
       VAULT_ADDR: https://vault.example.com:8200
       VAULT_NAMESPACE: admin
       VAULT_CACERT: ~/certs/prod-ca.pem
+      login: -method=oidc -path=sso
+
+'login' is not a variable: it holds the arguments for 'vault login'. 'vctx use'
+and the UI log in with them when a context has no working token; vault asks for
+the password or opens the browser itself, so no secret goes in the config.
 
 Before running a command vctx calls the unauthenticated sys/health endpoint,
 so a VPN or tunnel that is down, or an ingress rejecting your IP, fails in
@@ -214,6 +221,7 @@ func (a *app) run(args []string) error {
 			return err
 		}
 		a.printUsing(rest[0], cfg)
+		a.ensureLogin(cfg, rest[0])
 		return nil
 	case "current":
 		if len(rest) > 0 {
