@@ -22,7 +22,7 @@ func TestInitWritesOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Count(string(b), initMarker) != 1 || !strings.Contains(string(b), `eval "$(command vctx init zsh)"`) {
+	if strings.Count(string(b), initMarker) != 1 || !strings.Contains(string(b), initLine("zsh")) {
 		t.Errorf(".zshrc:\n%s", b)
 	}
 	if !strings.Contains(out.String(), "already set up") {
@@ -49,7 +49,7 @@ func TestRCFile(t *testing.T) {
 
 func TestInitPrintsScript(t *testing.T) {
 	a, out, _ := newTestApp(t)
-	if err := a.run([]string{"init", "fish"}); err != nil || !strings.Contains(out.String(), "--shell fish --default | source") {
+	if err := a.run([]string{"init", "fish"}); err != nil || !strings.Contains(out.String(), "env --shell fish --default 2>/dev/null | source") {
 		t.Errorf("fish: %v\n%s", err, out)
 	}
 	var uerr usageError
@@ -88,7 +88,11 @@ func TestFishEnv(t *testing.T) {
 }
 
 func TestUseUnderIntegrationIsQuiet(t *testing.T) {
-	a, _, _ := newTestApp(t, "VCTX_CONTEXT=prod", "VCTX_SHELL=1")
+	choice := filepath.Join(t.TempDir(), "choice")
+	if err := os.WriteFile(choice, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a, _, _ := newTestApp(t, "VCTX_CONTEXT=prod", "VCTX_CHOICE_FILE="+choice)
 	var stderr strings.Builder
 	a.stderr = &stderr
 	if err := a.run([]string{"use", "dev"}); err != nil {
@@ -96,6 +100,9 @@ func TestUseUnderIntegrationIsQuiet(t *testing.T) {
 	}
 	if strings.Contains(stderr.String(), "precedence") {
 		t.Errorf("override note under the integration: %q", stderr.String())
+	}
+	if b, _ := os.ReadFile(choice); string(b) != "dev" {
+		t.Errorf("choice file = %q, want dev", b)
 	}
 }
 
@@ -113,7 +120,8 @@ func TestBashIntegration(t *testing.T) {
 	}
 	home := filepath.Join(dir, "home")
 	cfg := filepath.Join(dir, "c.yaml")
-	if err := os.WriteFile(cfg, []byte("contexts:\n  a:\n    VAULT_ADDR: http://a\n  b:\n    VAULT_ADDR: http://b\n"), 0o600); err != nil {
+	// b sets a PATH without vctx in it: the function must still reach vctx.
+	if err := os.WriteFile(cfg, []byte("contexts:\n  a:\n    VAULT_ADDR: http://a\n  b:\n    VAULT_ADDR: http://b\n    PATH: /usr/bin:/bin\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	env := []string{
@@ -137,8 +145,47 @@ func TestBashIntegration(t *testing.T) {
 	if runtime.GOOS == "darwin" {
 		flags = append([]string{"-l"}, flags...)
 	}
-	out := run(bash, append(flags, `echo "start=$VAULT_ADDR"; vctx use b >/dev/null 2>&1; echo "after=$VAULT_ADDR"`)...)
-	if !strings.Contains(out, "start=http://a") || !strings.Contains(out, "after=http://b") {
-		t.Errorf("bash session:\n%s", out)
+	out := run(bash, append(flags, `echo "start=$VAULT_ADDR"
+vctx use b >/dev/null 2>&1; echo "b=$VAULT_ADDR"
+vctx use a >/dev/null 2>&1; echo "back=$VAULT_ADDR"
+vctx ls >/dev/null 2>&1; vctx >/dev/null 2>&1; echo "unchanged=$VAULT_ADDR"`)...)
+	for _, want := range []string{"start=http://a", "b=http://b", "back=http://a", "unchanged=http://a"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("bash session lacks %q:\n%s", want, out)
+		}
+	}
+	// A non-interactive shell (a script) is left alone.
+	if out := run(bash, "-l", "-c", `echo "script=$VAULT_ADDR"`); strings.Contains(out, "script=http") {
+		t.Errorf("non-interactive shell got a context: %q", out)
+	}
+}
+
+func TestInitFindsHandWrittenLine(t *testing.T) {
+	a, out, _ := newTestApp(t, "SHELL=/bin/zsh")
+	a.home = t.TempDir()
+	rc := filepath.Join(a.home, ".zshrc")
+	if err := os.WriteFile(rc, []byte(`eval "$(vctx init zsh)"`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.run([]string{"init"}); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(rc); strings.Contains(string(b), initMarker) || !strings.Contains(out.String(), "already set up") {
+		t.Errorf("hand-written line duplicated:\n%s", b)
+	}
+}
+
+func TestBashProfileOnMacKeepsExistingProfile(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("macOS login shells only")
+	}
+	a, _, _ := newTestApp(t)
+	a.home = t.TempDir()
+	profile := filepath.Join(a.home, ".profile")
+	if err := os.WriteFile(profile, []byte("export MYPROFILE=loaded\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := a.rcFile("bash"); err != nil || got != profile {
+		t.Errorf("rc file = %q, %v; want the existing .profile", got, err)
 	}
 }

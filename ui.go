@@ -222,7 +222,8 @@ func (a *app) printUsing(name string, cfg *config) {
 	vars, _ := cfg.vars(name, a.home)
 	addr := redactAddr(vaultAddr(vars))
 	override := a.shellOverride(name)
-	if a.getenv("VCTX_SHELL") != "" {
+	integrated := a.getenv(envChoiceFile) != ""
+	if integrated {
 		override = "" // the shell integration switches this terminal right after
 	}
 	if !a.stderrTTY {
@@ -234,8 +235,8 @@ func (a *app) printUsing(name string, cfg *config) {
 	}
 	p := newPalette(a.stderr)
 	fmt.Fprintf(a.stderr, "%s %s %s\n", p.accent.Render("●"), p.bold.Render(name), p.dim.Render(addr))
-	if a.getenv("VCTX_SHELL") != "" {
-		return // the shell integration switches this terminal right after
+	if integrated {
+		return
 	}
 	if override != "" {
 		fmt.Fprintln(a.stderr, p.warn.Render(fmt.Sprintf("  this shell has %s=%s, it takes precedence here", envContext, override)))

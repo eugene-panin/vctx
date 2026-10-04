@@ -99,7 +99,7 @@ func planEnv(environ []string, vars map[string]string) envPlan {
 	for _, kv := range environ {
 		k, v, _ := strings.Cut(kv, "=")
 		switch {
-		case strings.HasPrefix(k, "VAULT_"), k == envContext, k == envContextAddr, k == envContextNS:
+		case strings.HasPrefix(k, "VAULT_"), k == envContext, k == envContextAddr, k == envContextNS, k == envChoiceFile:
 			drop[k] = true
 		case k == envManaged:
 			drop[k] = true

@@ -22,10 +22,12 @@ Usage:
   vctx                             interactive UI: status, switch, login, shell
   vctx <context> [vault args...]   run vault against <context>
   vctx exec [<context>] -- cmd     run any command with <context> variables
-  vctx init                        set up your shell once: then 'vctx use'
+  vctx init [--shell zsh|bash|fish] set up your shell once: then 'vctx use'
                                    switches the terminal and vault follows
-  vctx env [<context>]             print exports: eval "$(vctx env prod)"
+  vctx init <shell>                print the integration 'vctx init' loads
+  vctx env [<context>|--default]   print exports: eval "$(vctx env prod)"
   vctx env --clear                 print commands that undo 'vctx env'
+  vctx env ... --shell fish        the same in fish syntax
   vctx use [<context>]             switch to <context>, logging in if needed
                                    (the UI without a name)
   vctx current                     print the active context
@@ -221,6 +223,7 @@ func (a *app) run(args []string) error {
 		if err := a.use(cfg, rest[0]); err != nil {
 			return err
 		}
+		a.announceChoice(rest[0])
 		a.printUsing(rest[0], cfg)
 		a.ensureLogin(cfg, rest[0])
 		return nil

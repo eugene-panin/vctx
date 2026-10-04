@@ -216,6 +216,7 @@ func (m *model) update(msg tea.Msg) tea.Cmd {
 		}
 		return m.loadTokens()
 	case execDoneMsg:
+		m.current, _ = m.a.contextName("") // `vctx use` may have run in the shell
 		if msg.err != nil {
 			m.setFlash(fmt.Sprintf("%s: %v", msg.what, msg.err), false)
 		} else {
@@ -547,6 +548,7 @@ func (a *app) ui() error {
 		return err
 	}
 	if m.chosen != "" {
+		a.announceChoice(m.chosen)
 		a.printUsing(m.chosen, cfg)
 		a.ensureLogin(cfg, m.chosen)
 	}
