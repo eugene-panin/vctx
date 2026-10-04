@@ -268,12 +268,12 @@ func TestExecForms(t *testing.T) {
 		wantArgv []string
 		wantNS   bool // prod's namespace, not the default dev's
 	}{
-		{[]string{"exec", "--", "vault", "status"}, []string{"vault", "status"}, false},
-		{[]string{"exec", "prod", "--", "vault", "-x"}, []string{"vault", "-x"}, true},
+		{[]string{"exec", "--", "sh", "status"}, []string{"sh", "status"}, false},
+		{[]string{"exec", "prod", "--", "sh", "-x"}, []string{"sh", "-x"}, true},
 		{[]string{"exec", "prod", "sh", "-c", "true"}, []string{"sh", "-c", "true"}, true},
 	}
 	for _, tc := range tests {
-		a, _, call := newTestApp(t, "VCTX_VAULT_BIN=vault")
+		a, _, call := newTestApp(t)
 		if err := a.run([]string{"use", "dev"}); err != nil {
 			t.Fatal(err)
 		}
