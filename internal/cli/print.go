@@ -12,7 +12,6 @@ import (
 	"github.com/eugene-panin/vctx/internal/environ"
 	"github.com/eugene-panin/vctx/internal/safefile"
 	"github.com/eugene-panin/vctx/internal/shell"
-	"github.com/eugene-panin/vctx/internal/style"
 )
 
 func isTerminal(f *os.File) bool {
@@ -34,7 +33,7 @@ func (a *app) printUsing(name string, cfg *config.Config) {
 		}
 		return
 	}
-	p := style.New(a.stderr)
+	p := a.palette(a.stderr)
 	fmt.Fprintf(a.stderr, "%s %s %s\n", p.Accent.Render("●"), p.Bold.Render(name), p.Dim.Render(addr))
 	if integrated {
 		return

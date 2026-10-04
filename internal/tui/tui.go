@@ -10,11 +10,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/bubbles/help"
-	"github.com/charmbracelet/bubbles/key"
-	"github.com/charmbracelet/bubbles/spinner"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/bubbles/v2/help"
+	"charm.land/bubbles/v2/key"
+	"charm.land/bubbles/v2/spinner"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 	"github.com/eugene-panin/vctx/internal/config"
 	"github.com/eugene-panin/vctx/internal/environ"
 	"github.com/eugene-panin/vctx/internal/probe"
@@ -95,7 +95,7 @@ type model struct {
 	tokenGen     int // bumped per load, and on forget, so a late answer is ignored
 }
 
-func newModel(b Backend, contexts []probe.Instance, timeout time.Duration, out io.Writer) *model {
+func newModel(b Backend, contexts []probe.Instance, timeout time.Duration) *model {
 	if timeout == 0 {
 		timeout = probe.DefaultTimeout
 	}
@@ -104,11 +104,16 @@ func newModel(b Backend, contexts []probe.Instance, timeout time.Duration, out i
 		timeout: timeout,
 		spin:    spinner.New(spinner.WithSpinner(spinner.MiniDot)),
 		help:    help.New(),
-		p:       style.New(out),
+		p:       style.Full(),
 		tokens:  map[string]token.State{},
 		current: b.Current(),
 	}
 	m.spin.Style = m.p.Accent
+	// The terminal's own colors: bubbles' defaults would need to know its background.
+	m.help.Styles = help.Styles{
+		Ellipsis: m.p.Dim, ShortKey: m.p.Dim.Bold(true), ShortDesc: m.p.Dim, ShortSeparator: m.p.Dim,
+		FullKey: m.p.Dim.Bold(true), FullDesc: m.p.Dim, FullSeparator: m.p.Dim,
+	}
 	for _, c := range contexts {
 		if c.Status.Name == m.current {
 			m.cursor = len(m.rows)
@@ -182,7 +187,7 @@ func (m *model) update(msg tea.Msg) tea.Cmd {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
-		m.help.Width = msg.Width
+		m.help.SetWidth(msg.Width)
 	case spinner.TickMsg:
 		if !m.probing() {
 			return nil
@@ -219,13 +224,13 @@ func (m *model) update(msg tea.Msg) tea.Cmd {
 			m.setFlash(msg.what+" finished", true)
 		}
 		return tea.Batch(m.spin.Tick, m.probe(msg.i), m.loadTokens())
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
 		return m.handleKey(msg)
 	}
 	return nil
 }
 
-func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
+func (m *model) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 	if key.Matches(msg, keys.Quit) {
 		return tea.Quit
 	}
@@ -324,7 +329,13 @@ func (m *model) scroll() {
 	m.offset = min(m.offset, max(len(m.rows)-visible, 0))
 }
 
-func (m *model) View() string {
+func (m *model) View() tea.View {
+	v := tea.NewView(m.render())
+	v.AltScreen = true
+	return v
+}
+
+func (m *model) render() string {
 	if m.width == 0 {
 		return ""
 	}
@@ -384,9 +395,11 @@ func (m *model) tableView(width, height int) string {
 		statuses[i] = r.Status
 	}
 	cols, levels := table.Columns(statuses, m.current, m.tokens)
+	probingText := m.spin.View() + " checking"
 	for i, r := range m.rows {
 		if r.probing {
-			cols[table.ColStatus].Cells[i] = "checking"
+			// As wide as what is drawn there, so the column makes room for the spinner.
+			cols[table.ColStatus].Cells[i] = probingText
 			cols[table.ColLatency].Cells[i] = ""
 		}
 	}
@@ -410,12 +423,7 @@ func (m *model) tableView(width, height int) string {
 		if selected {
 			gut = m.p.Accent.Render("▌") + " "
 		}
-		lines = append(lines, line(gut, func(c int) string {
-			if c == table.ColStatus && m.rows[i].probing {
-				return m.spin.View() + " checking"
-			}
-			return cols[c].Cells[i]
-		}, func(c int) lipgloss.Style {
+		lines = append(lines, line(gut, func(c int) string { return cols[c].Cells[i] }, func(c int) lipgloss.Style {
 			return table.CellStyle(m.p, c, levels[i], m.tokens[m.rows[i].Status.Name], selected, m.rows[i].probing)
 		}))
 	}
@@ -444,7 +452,7 @@ func (m *model) detailView(width, height int) string {
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color("8")).
 		Padding(0, 1).
-		Width(width - 2)
+		Width(width)
 	inner := width - 4
 
 	label := func(s string) string { return m.p.Dim.Render(fmt.Sprintf("%-8s", s)) }
@@ -546,9 +554,10 @@ type Backend interface {
 
 // Run shows the interface until the user quits or picks a context with
 // enter, which it returns after b.Use has made it the default.
-func Run(b Backend, contexts []probe.Instance, timeout time.Duration, in io.Reader, out io.Writer) (chosen string, err error) {
-	m := newModel(b, contexts, timeout, out)
-	if _, err := tea.NewProgram(m, tea.WithAltScreen(), tea.WithInput(in), tea.WithOutput(out)).Run(); err != nil {
+// env decides the colors, as the terminal settings in it say.
+func Run(b Backend, contexts []probe.Instance, timeout time.Duration, in io.Reader, out io.Writer, env []string) (chosen string, err error) {
+	m := newModel(b, contexts, timeout)
+	if _, err := tea.NewProgram(m, tea.WithInput(in), tea.WithOutput(out), tea.WithEnvironment(env)).Run(); err != nil {
 		return "", err
 	}
 	return m.chosen, nil

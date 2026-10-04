@@ -73,7 +73,7 @@ Environment:
   VCTX_CONTEXT        set for vault and in a 'vctx env' shell: the context
                       (with VCTX_CONTEXT_ADDR, VCTX_CONTEXT_NAMESPACE,
                       VCTX_VARS, VCTX_SAVED_*)
-  NO_COLOR            no colors
+  NO_COLOR            no colors (also --no-color)
 
 Exit status: 0 on success, 1 on failure, 2 for a malformed command line.
 
@@ -140,6 +140,7 @@ func (a *app) rootCmd(rawArgs []string) *cobra.Command {
 	// Declared before cobra adds its own, so --version gets no -v shorthand.
 	root.Flags().Bool("version", false, "print the vctx version")
 	root.PersistentFlags().BoolVar(&a.noInput, "no-input", false, "never ask anything; skip logging in when it would need answers")
+	root.PersistentFlags().BoolVar(&a.noColor, "no-color", false, "no colors")
 	root.SetVersionTemplate("vctx {{.Version}}\n")
 	root.SetHelpTemplate(helpTemplate)
 	root.SetUsageTemplate(usageTemplate)
@@ -155,7 +156,9 @@ func (a *app) rootCmd(rawArgs []string) *cobra.Command {
 // commandNames are the names and aliases of every subcommand, hidden ones and
 // cobra's own included: context names must not shadow them.
 func (a *app) commandNames() []string {
-	root := a.rootCmd(nil)
+	// On a copy: defining the flags again would reset the ones already parsed.
+	scratch := *a
+	root := scratch.rootCmd(nil)
 	root.InitDefaultHelpCmd()
 	root.InitDefaultCompletionCmd()
 	var names []string

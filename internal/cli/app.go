@@ -19,6 +19,7 @@ import (
 	"github.com/eugene-panin/vctx/internal/environ"
 	"github.com/eugene-panin/vctx/internal/safefile"
 	"github.com/eugene-panin/vctx/internal/shell"
+	"github.com/eugene-panin/vctx/internal/style"
 	"github.com/eugene-panin/vctx/internal/token"
 )
 
@@ -37,6 +38,20 @@ type app struct {
 	keyring                        token.SecretService // nil means the system keychain
 	version                        string
 	noInput                        bool // --no-input: never ask
+	noColor                        bool // --no-color
+}
+
+// colorEnv is the environment styling decides by: NO_COLOR, TERM.
+func (a *app) colorEnv() []string {
+	if a.noColor {
+		return append(slices.Clip(a.environ), "NO_COLOR=1")
+	}
+	return a.environ
+}
+
+// palette styles text written to w.
+func (a *app) palette(w io.Writer) style.Palette {
+	return style.New(w, a.colorEnv())
 }
 
 // errSilent ends the program with status 1 but no message: the failure is already on screen.

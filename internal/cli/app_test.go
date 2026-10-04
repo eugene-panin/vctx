@@ -617,3 +617,14 @@ func TestVersion(t *testing.T) {
 		t.Errorf("-v: %v", err)
 	}
 }
+
+// Loading the config builds the command tree again; flags already parsed stay.
+func TestFlagsSurviveConfigLoad(t *testing.T) {
+	a, _, _ := newTestApp(t)
+	if err := a.run([]string{"--no-color", "--no-input", "ls"}); err != nil {
+		t.Fatal(err)
+	}
+	if !a.noColor || !a.noInput {
+		t.Errorf("noColor %v, noInput %v", a.noColor, a.noInput)
+	}
+}

@@ -4,7 +4,7 @@ import (
 	"maps"
 	"slices"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 	"github.com/eugene-panin/vctx/internal/config"
 	"github.com/eugene-panin/vctx/internal/environ"
 	"github.com/eugene-panin/vctx/internal/login"
@@ -36,7 +36,7 @@ func (a *app) ui() error {
 		return err
 	}
 	logins := a.loginRunner(timeout)
-	chosen, err := tui.Run(uiBackend{a, cfg, logins}, contexts, timeout, a.stdin, a.stdout)
+	chosen, err := tui.Run(uiBackend{a, cfg, logins}, contexts, timeout, a.stdin, a.stdout, a.colorEnv())
 	if err != nil || chosen == "" {
 		return err
 	}

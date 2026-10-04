@@ -7,7 +7,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/term"
 	"github.com/eugene-panin/vctx/internal/probe"
 	"github.com/eugene-panin/vctx/internal/style"
@@ -106,8 +106,7 @@ func Columns(statuses []probe.Status, current string, tokens map[string]token.St
 // Render renders statuses for out, fitted to its width: current marks the
 // active context, tokens what each has stored, and tokenErr is shown when
 // token status could not be read.
-func Render(out io.Writer, statuses []probe.Status, current string, tokens map[string]token.State, tokenErr error) string {
-	p := style.New(out)
+func Render(out io.Writer, p style.Palette, statuses []probe.Status, current string, tokens map[string]token.State, tokenErr error) string {
 	cols, levels := Columns(statuses, current, tokens)
 	width := terminalWidth(out)
 	if width <= 0 {

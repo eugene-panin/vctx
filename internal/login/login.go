@@ -42,6 +42,15 @@ type Runner struct {
 	In          io.Reader
 	Out         io.Writer // where vctx reports and asks, stderr for the CLI
 	Interactive bool      // In and Out are a terminal: there is someone to ask
+	NoColor     bool      // --no-color
+}
+
+// colorEnv is the environment styling decides by.
+func (r *Runner) colorEnv() []string {
+	if r.NoColor {
+		return append(slices.Clip(r.Environ), "NO_COLOR=1")
+	}
+	return r.Environ
 }
 
 // errCancelled is a login given up with Ctrl-C.
@@ -173,7 +182,7 @@ func (r *Runner) Ensure(ctx context.Context, cfg *config.Config, name string) {
 	if !r.Interactive {
 		return // nothing to ask in a script
 	}
-	p := style.New(r.Out)
+	p := style.New(r.Out, r.colorEnv())
 	warn := func(format string, args ...any) {
 		fmt.Fprintln(r.Out, p.Warn.Render("  "+fmt.Sprintf(format, args...)))
 	}
@@ -310,7 +319,7 @@ func (r *Runner) helperEnv(cfg *config.Config, name string) ([]string, error) {
 // remembers the answers once a login with them succeeds. When a remembered
 // method fails, it offers to choose another.
 func (r *Runner) login(ctx context.Context, cfg *config.Config, name, reason string, env []string, in io.Reader, out io.Writer) error {
-	p := style.New(out)
+	p := style.New(out, r.colorEnv())
 	ans := newAnswers(ctx, in)
 	defer ans.close()
 

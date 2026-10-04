@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/eugene-panin/vctx/internal/probe"
-	"github.com/eugene-panin/vctx/internal/style"
 	"github.com/eugene-panin/vctx/internal/table"
 )
 
@@ -116,7 +115,7 @@ func (a *app) check(args []string, asJSON bool) error {
 	case a.stdoutTTY:
 		current, _ := a.contextName("")
 		tokens, tokenErr := a.tokenStatus(cfg, names)
-		fmt.Fprintln(a.stdout, table.Render(a.stdout, statuses, current, tokens, tokenErr))
+		fmt.Fprintln(a.stdout, table.Render(a.stdout, a.palette(a.stdout), statuses, current, tokens, tokenErr))
 	default:
 		tw := tabwriter.NewWriter(a.stdout, 0, 4, 2, ' ', 0)
 		for _, s := range statuses {
@@ -157,7 +156,7 @@ func (a *app) spin(title string, fn func()) {
 		return
 	}
 	f := a.stderr
-	p := style.New(f)
+	p := a.palette(f)
 	done := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Go(func() {

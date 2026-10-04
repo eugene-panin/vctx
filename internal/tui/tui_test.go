@@ -1,7 +1,6 @@
 package tui
 
 import (
-	"bytes"
 	"errors"
 	"maps"
 	"slices"
@@ -9,9 +8,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/charmbracelet/bubbles/spinner"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/bubbles/v2/spinner"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/eugene-panin/vctx/internal/config"
 	"github.com/eugene-panin/vctx/internal/probe"
 	"github.com/eugene-panin/vctx/internal/token"
@@ -79,7 +79,7 @@ func prepare(t *testing.T, cfg *config.Config) []probe.Instance {
 func newModelFor(t *testing.T, cfg *config.Config) (*model, *fakeBackend) {
 	t.Helper()
 	b := newFakeBackend()
-	return newModel(b, prepare(t, cfg), time.Second, &bytes.Buffer{}), b
+	return newModel(b, prepare(t, cfg), time.Second), b
 }
 
 // newTestModel has dev answered as active and prod blocked by an ingress.
@@ -105,7 +105,7 @@ func TestViewFitsWindow(t *testing.T) {
 	}
 	for _, size := range sizes {
 		m.Update(tea.WindowSizeMsg{Width: size[0], Height: size[1]})
-		view := m.View()
+		view := m.render()
 		lines := strings.Split(view, "\n")
 		if len(lines) > size[1] {
 			t.Errorf("%dx%d: %d lines:\n%s", size[0], size[1], len(lines), view)
@@ -126,7 +126,8 @@ func TestViewWhileProbing(t *testing.T) {
 	m.Init() // marks every row as probing; the probes themselves are not run
 	for _, w := range []int{60, 150} {
 		m.Update(tea.WindowSizeMsg{Width: w, Height: 24})
-		if view := m.View(); !strings.Contains(view, m.spin.View()+" checking") {
+		// Every row shows the spinner in full, not cut to "check…".
+		if view := ansi.Strip(m.render()); strings.Count(view, ansi.Strip(m.spin.View())+" checking") < 1+len(m.rows) {
 			t.Errorf("width %d: no spinner while probing:\n%s", w, view)
 		}
 	}
@@ -135,8 +136,8 @@ func TestViewWhileProbing(t *testing.T) {
 func TestEnterMakesDefault(t *testing.T) {
 	m, b := newTestModel(t)
 	m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
-	m.Update(tea.KeyMsg{Type: tea.KeyDown})
-	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	_, cmd := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 	if m.chosen != "prod" {
 		t.Fatalf("chosen = %q, want prod", m.chosen)
 	}
@@ -152,7 +153,7 @@ func TestForgetToken(t *testing.T) {
 	m, b := newTestModel(t)
 	b.tokens["dev"] = token.OK
 	m.Update(m.loadTokens()()) // as after a login
-	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
+	_, cmd := m.Update(tea.KeyPressMsg{Code: 'x', Text: "x"})
 	if cmd == nil {
 		t.Fatal("x did nothing")
 	}
@@ -173,7 +174,7 @@ func TestStaleProbeIgnored(t *testing.T) {
 	m, _ := newTestModel(t)
 	m.probe(0)
 	stale := m.rows[0].gen
-	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
+	m.Update(tea.KeyPressMsg{Code: 'r', Text: "r"})
 	m.Update(probeMsg{i: 0, gen: stale, res: probe.Result{Err: errors.New("old")}})
 	if !m.rows[0].probing || m.rows[0].Status.Err != nil {
 		t.Errorf("stale answer applied: probing=%v err=%v", m.rows[0].probing, m.rows[0].Status.Err)
@@ -204,7 +205,7 @@ func TestDisplayValue(t *testing.T) {
 func TestDetailShowsDefaults(t *testing.T) {
 	m, _ := newTestModel(t)
 	m.Update(tea.WindowSizeMsg{Width: 150, Height: 30})
-	if view := m.View(); !strings.Contains(view, "VAULT_FORMAT=json") {
+	if view := m.render(); !strings.Contains(view, "VAULT_FORMAT=json") {
 		t.Errorf("defaults missing from details:\n%s", view)
 	}
 }
@@ -212,8 +213,8 @@ func TestDetailShowsDefaults(t *testing.T) {
 func TestScrollKeepsCursorVisible(t *testing.T) {
 	m, _ := newTestModel(t)
 	m.Update(tea.WindowSizeMsg{Width: 60, Height: 7})
-	m.Update(tea.KeyMsg{Type: tea.KeyDown})
-	if view := m.View(); !strings.Contains(view, "prod") {
+	m.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	if view := m.render(); !strings.Contains(view, "prod") {
 		t.Errorf("selected row scrolled out:\n%s", view)
 	}
 }
@@ -223,7 +224,7 @@ func TestStaleTokenStatusIgnored(t *testing.T) {
 	b.tokens["dev"] = token.OK
 	slow := m.loadTokens()() // started before the token is forgotten, answers after
 	m.Update(m.loadTokens()())
-	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
+	_, cmd := m.Update(tea.KeyPressMsg{Code: 'x', Text: "x"})
 	_, cmd = m.Update(cmd())
 	m.Update(slow)
 	m.Update(cmd())
@@ -242,7 +243,7 @@ func TestRefreshRetriesConfigErrorsFromProbe(t *testing.T) {
 		t.Fatalf("status = %q", short)
 	}
 	gen := m.rows[0].gen
-	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
+	m.Update(tea.KeyPressMsg{Code: 'r', Text: "r"})
 	if m.rows[0].gen == gen {
 		t.Error("refresh skipped a context whose address is fine")
 	}
@@ -276,16 +277,16 @@ func TestEveryKeyOnEveryKindOfContext(t *testing.T) {
 		"down":    {"VAULT_ADDR": vaulttest.ClosedURL(t)},
 		"noca":    {"VAULT_ADDR": ok, "VAULT_CACERT": "/nonexistent/ca.pem"},
 	}}
-	press := func(s string) tea.KeyMsg {
+	press := func(s string) tea.KeyPressMsg {
 		switch s {
 		case "down":
-			return tea.KeyMsg{Type: tea.KeyDown}
+			return tea.KeyPressMsg{Code: tea.KeyDown}
 		case "up":
-			return tea.KeyMsg{Type: tea.KeyUp}
+			return tea.KeyPressMsg{Code: tea.KeyUp}
 		case "enter":
-			return tea.KeyMsg{Type: tea.KeyEnter}
+			return tea.KeyPressMsg{Code: tea.KeyEnter}
 		}
-		return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s)}
+		return tea.KeyPressMsg{Code: rune(s[0]), Text: s}
 	}
 
 	for row := range 4 {
@@ -306,7 +307,7 @@ func TestEveryKeyOnEveryKindOfContext(t *testing.T) {
 				_, cmd = m.Update(execDoneMsg{i: m.cursor, what: name + " " + k})
 				drain(t, m, cmd, 0)
 			}
-			for _, line := range strings.Split(m.View(), "\n") {
+			for _, line := range strings.Split(m.render(), "\n") {
 				if lipgloss.Width(line) > 120 {
 					t.Errorf("%s after %q: line too wide: %q", name, k, line)
 				}
@@ -323,7 +324,7 @@ func TestMultilineValueInDetails(t *testing.T) {
 		"x": {"VAULT_ADDR": "http://v", "VAULT_CACERT_BYTES": "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"},
 	}})
 	m.Update(tea.WindowSizeMsg{Width: 150, Height: 30})
-	view := m.View()
+	view := m.render()
 	if !strings.Contains(view, "VAULT_CACERT_BYTES=-----BEGIN CERTIFICATE-----…") || strings.Contains(view, "MIIB") {
 		t.Errorf("details:\n%s", view)
 	}
@@ -332,7 +333,7 @@ func TestMultilineValueInDetails(t *testing.T) {
 func TestForgetBeforeStatusLoads(t *testing.T) {
 	m, b := newTestModel(t)
 	b.tokens["dev"] = token.OK
-	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
+	_, cmd := m.Update(tea.KeyPressMsg{Code: 'x', Text: "x"})
 	if cmd == nil {
 		t.Fatalf("x refused before token status loaded: %q", m.flash)
 	}
@@ -347,7 +348,7 @@ func TestBadAddressShown(t *testing.T) {
 		"noscheme": {"VAULT_ADDR": "vault.example.com:8200"},
 	}})
 	m.Update(tea.WindowSizeMsg{Width: 120, Height: 20})
-	if view := m.View(); !strings.Contains(view, "config error") {
+	if view := m.render(); !strings.Contains(view, "config error") {
 		t.Errorf("UI:\n%s", view)
 	}
 }
@@ -355,9 +356,25 @@ func TestBadAddressShown(t *testing.T) {
 func TestDetailShowsLoginMethod(t *testing.T) {
 	b := newFakeBackend()
 	b.logins["dev"] = []string{"-method=oidc", "-path=sso"}
-	m := newModel(b, prepare(t, testConfig), time.Second, &bytes.Buffer{})
+	m := newModel(b, prepare(t, testConfig), time.Second)
 	m.Update(tea.WindowSizeMsg{Width: 150, Height: 30})
-	if view := m.View(); !strings.Contains(view, "-method=oidc -path=sso") {
+	if view := m.render(); !strings.Contains(view, "-method=oidc -path=sso") {
 		t.Errorf("details:\n%s", view)
+	}
+}
+
+// The detail box keeps its border straight around wrapped error text.
+func TestDetailBoxIsRectangular(t *testing.T) {
+	m, _ := newTestModel(t)
+	m.cursor = 1 // prod, blocked: a long error that wraps
+	for _, w := range []int{120, 150} {
+		m.Update(tea.WindowSizeMsg{Width: w, Height: 30})
+		box := m.detailView(m.layout().detailW, 0)
+		lines := strings.Split(box, "\n")
+		for _, l := range lines {
+			if lipgloss.Width(l) != lipgloss.Width(lines[0]) {
+				t.Errorf("width %d: line %q is %d wide, the top %d", w, ansi.Strip(l), lipgloss.Width(l), lipgloss.Width(lines[0]))
+			}
+		}
 	}
 }
