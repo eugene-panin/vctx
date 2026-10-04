@@ -30,7 +30,7 @@ var (
 	envKeyRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 	// Context names double as subcommands ("vctx prod ..."), so they must not shadow real ones.
-	reservedNames = []string{"help", "ui", "init", "ls", "list", "use", "current", "env", "exec", "check", "logout", "get", "store", "erase"}
+	reservedNames = []string{"help", "version", "ui", "init", "ls", "list", "use", "current", "env", "exec", "check", "logout", "get", "store", "erase"}
 )
 
 // DefaultAddr is where the Vault CLI goes without VAULT_ADDR.

@@ -42,6 +42,7 @@ Usage:
   vctx check [<context>...]        show reachability, version and seal status
   vctx logout [<context>]          forget the stored token of <context>, or
                                    in a context shell the one vault uses
+  vctx version                     print the vctx version
 
 The context is taken from the explicit name, then $VCTX_CONTEXT,
 then the default set by 'vctx use'.
@@ -117,6 +118,7 @@ type app struct {
 	stdinTTY, stdoutTTY, stderrTTY bool
 	exec                           func(argv0 string, argv, envv []string) error
 	keyring                        token.SecretService // nil means the system keychain
+	version                        string
 }
 
 // errSilent ends the program with status 1 but no message: the failure is already on screen.
@@ -128,10 +130,12 @@ type usageError string
 func (e usageError) Error() string { return string(e) }
 
 // Main runs vctx with the process's arguments and returns its exit status:
-// 2 for a malformed command line, 1 for any other failure.
-func Main() int {
+// 2 for a malformed command line, 1 for any other failure. version is what
+// 'vctx version' prints.
+func Main(version string) int {
 	a, err := newApp()
 	if err == nil {
+		a.version = version
 		err = a.run(os.Args[1:])
 	}
 	var uerr usageError
@@ -215,6 +219,9 @@ func (a *app) run(args []string) error {
 	switch cmd, rest := args[0], args[1:]; cmd {
 	case "help", "-h", "--help":
 		fmt.Fprint(a.stdout, usage)
+		return nil
+	case "version", "--version":
+		fmt.Fprintln(a.stdout, "vctx", a.version)
 		return nil
 	case "ui":
 		return a.ui()
@@ -354,7 +361,11 @@ func (a *app) vaultBin() string {
 }
 
 func (a *app) loadConfig() (*config.Config, error) {
-	return config.Load(a.configPath)
+	cfg, err := config.Load(a.configPath)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, fmt.Errorf("no config at %s: create it, the format is in 'vctx help'", a.configPath)
+	}
+	return cfg, err
 }
 
 func (a *app) currentFile() string {

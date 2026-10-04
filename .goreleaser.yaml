@@ -1,0 +1,47 @@
+version: 2
+project_name: vctx
+
+builds:
+  - main: .
+    binary: vctx
+    env:
+      - CGO_ENABLED=0
+    goos: [darwin, linux]
+    goarch: [amd64, arm64]
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version=v{{ .Version }}
+
+archives:
+  - formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  use: git
+  sort: asc
+
+homebrew_casks:
+  - name: vctx
+    repository:
+      owner: eugene-panin
+      name: homebrew-tap
+    directory: Casks
+    homepage: https://github.com/eugene-panin/vctx
+    description: Switch the Vault CLI between several Vault instances
+    license: MIT
+    caveats: |
+      Put your Vault instances in ~/.config/vctx/config.yaml (format: vctx help),
+      then run once: vctx init
+    hooks:
+      post:
+        install: |
+          if OS.mac?
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/vctx"]
+          end
