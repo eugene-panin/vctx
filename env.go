@@ -67,9 +67,11 @@ func (a *app) contextVars(cfg *config, name string) (map[string]string, error) {
 	return vars, nil
 }
 
-// registerHelper points vault at vctx as its token helper, unless the context brings its own Vault config.
+// registerHelper points vault at vctx as its token helper, unless the context
+// brings its own Vault config. An empty VAULT_CONFIG_PATH counts as none: vault
+// would fall back to ~/.vault and the shared ~/.vault-token.
 func (a *app) registerHelper(vars map[string]string) error {
-	if _, ok := vars["VAULT_CONFIG_PATH"]; ok {
+	if vars["VAULT_CONFIG_PATH"] != "" {
 		return nil
 	}
 	p, err := a.writeVaultConfig()
@@ -99,7 +101,7 @@ func planEnv(environ []string, vars map[string]string) envPlan {
 	for _, kv := range environ {
 		k, v, _ := strings.Cut(kv, "=")
 		switch {
-		case strings.HasPrefix(k, "VAULT_"), k == envContext, k == envContextAddr, k == envContextNS, k == envChoiceFile:
+		case strings.HasPrefix(k, "VAULT_"), k == envContext, k == envContextAddr, k == envContextNS, k == envChoiceFD, k == envChoiceFile:
 			drop[k] = true
 		case k == envManaged:
 			drop[k] = true

@@ -9,32 +9,63 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
+	"syscall"
 )
 
 // initMarker labels the line `vctx init` adds.
 const initMarker = "# vctx shell integration"
 
-// envChoiceFile names the file the shell function creates for each call:
-// vctx writes the context it switched to there, and the function then
-// switches the terminal. Nothing else changes the terminal's context.
-const envChoiceFile = "VCTX_CHOICE_FILE"
+// The shell function learns which context vctx switched to through
+// envChoiceFD in zsh and bash: a descriptor feeding a command substitution,
+// while vctx's own output still goes to the terminal; no temporary file to
+// leave behind when Ctrl-C ends the function. fish, which cannot redirect
+// like that, passes a temporary file in envChoiceFile instead. Nothing else
+// changes the terminal's context.
+const (
+	envChoiceFD   = "VCTX_CHOICE_FD"
+	envChoiceFile = "VCTX_CHOICE_FILE"
+)
 
-// posixInit is the zsh and bash integration, for interactive shells only. It
-// calls vctx by absolute path, so a context whose PATH lacks vctx cannot lock
-// the terminal in. New shells start in the default context, unless started
-// inside one (the UI's shell, `vctx exec -- zsh`).
-const posixInit = `case $- in
+// zshInit and bashInit are the integration, for interactive shells only. They
+// call vctx by absolute path, so a context whose PATH lacks vctx cannot lock
+// the terminal in. Ctrl-C reaches the shell too while it waits for vctx: a
+// handler (not an ignore, which vctx and vault would inherit) keeps the
+// function going, so a login cancelled with Ctrl-C still switches the
+// terminal. New shells start in the default context, unless started inside
+// one (the UI's shell, `vctx exec -- zsh`).
+const zshInit = `case $- in
 *i*)
 vctx() {
+  setopt local_options local_traps
   local choice rc
-  choice=$(mktemp "${TMPDIR:-/tmp}/vctx.XXXXXX") || return
-  VCTX_CHOICE_FILE="$choice" %[1]s "$@"
-  rc=$?
-  if [ -s "$choice" ]; then
-    eval "$(%[1]s env "$(cat "$choice")")"
+  trap ':' INT
+  { choice=$(VCTX_CHOICE_FD=3 %[1]s "$@" 3>&1 1>&4 4>&-); rc=$?; } 4>&1
+  if [ -n "$choice" ]; then
+    eval "$(%[1]s env "$choice")"
   fi
-  rm -f "$choice"
+  return $rc
+}
+if [ -z "${VCTX_CONTEXT:-}" ]; then
+  eval "$(%[1]s env --default 2>/dev/null)"
+fi
+;;
+esac
+`
+
+// bashInit restores the caller's INT trap by hand: bash has no local traps.
+const bashInit = `case $- in
+*i*)
+vctx() {
+  local choice rc int_trap
+  int_trap=$(trap -p INT)
+  trap ':' INT
+  { choice=$(VCTX_CHOICE_FD=3 %[1]s "$@" 3>&1 1>&4 4>&-); rc=$?; } 4>&1
+  if [ -n "$int_trap" ]; then eval "$int_trap"; else trap - INT; fi
+  if [ -n "$choice" ]; then
+    eval "$(%[1]s env "$choice")"
+  fi
   return $rc
 }
 if [ -z "${VCTX_CONTEXT:-}" ]; then
@@ -46,13 +77,13 @@ esac
 
 const fishInit = `if status is-interactive
     function vctx
-        set -l choice (mktemp)
+        set -l choice (mktemp); or return
         VCTX_CHOICE_FILE=$choice %[1]s $argv
         set -l rc $status
-        if test -s $choice
-            %[1]s env --shell fish (cat $choice) | source
+        if test -s "$choice"
+            %[1]s env --shell fish (cat "$choice") | source
         end
-        rm -f $choice
+        rm -f "$choice"
         return $rc
     end
     if not set -q VCTX_CONTEXT
@@ -152,8 +183,11 @@ func (a *app) initShell(args []string) error {
 
 func (a *app) printInit(shell string) error {
 	switch shell {
-	case "zsh", "bash":
-		_, err := fmt.Fprintf(a.stdout, posixInit, shellQuote(a.self))
+	case "zsh":
+		_, err := fmt.Fprintf(a.stdout, zshInit, shellQuote(a.self))
+		return err
+	case "bash":
+		_, err := fmt.Fprintf(a.stdout, bashInit, shellQuote(a.self))
 		return err
 	case "fish":
 		_, err := fmt.Fprintf(a.stdout, fishInit, fishQuote(a.self))
@@ -180,12 +214,18 @@ func fishQuote(s string) string {
 }
 
 // announceChoice tells the shell function, when it called vctx, which context
-// to switch the terminal to. The function created the file; vctx only fills it.
+// to switch the terminal to.
 func (a *app) announceChoice(name string) {
+	if f := choiceFD(a.environ); f != nil {
+		_, _ = io.WriteString(f, name)
+		f.Close()
+		return
+	}
 	path := a.getenv(envChoiceFile)
 	if path == "" {
 		return
 	}
+	// The function created the file; vctx only fills it.
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0)
 	if err != nil {
 		return
@@ -193,5 +233,27 @@ func (a *app) announceChoice(name string) {
 	defer f.Close()
 	if fi, err := f.Stat(); err == nil && fi.Mode().IsRegular() {
 		_, _ = io.WriteString(f, name)
+	}
+}
+
+// choiceFD opens the descriptor named by VCTX_CHOICE_FD, if it is a pipe as
+// the shell function sets up; nil otherwise.
+func choiceFD(environ []string) *os.File {
+	fd, err := strconv.Atoi(envValue(environ, envChoiceFD))
+	if err != nil || fd < 3 || fd > 9 {
+		return nil
+	}
+	f := os.NewFile(uintptr(fd), "choice")
+	if fi, err := f.Stat(); err != nil || fi.Mode()&os.ModeNamedPipe == 0 {
+		return nil
+	}
+	return f
+}
+
+// keepChoiceFD stops the choice descriptor from reaching anything vctx runs:
+// a daemon holding it open would keep the shell function waiting.
+func keepChoiceFD(environ []string) {
+	if fd, err := strconv.Atoi(envValue(environ, envChoiceFD)); err == nil && fd >= 3 && fd <= 9 {
+		syscall.CloseOnExec(fd)
 	}
 }

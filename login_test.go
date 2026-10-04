@@ -2,11 +2,14 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -61,6 +64,12 @@ func TestLoginInConfig(t *testing.T) {
 // when lookup is "loginfails".
 func fakeVault(t *testing.T, lookup string) (bin, log string) {
 	t.Helper()
+	return fakeVaultPrinting(t, lookup, "")
+}
+
+// fakeVaultPrinting is fakeVault whose `vault print token` prints printed.
+func fakeVaultPrinting(t *testing.T, lookup, printed string) (bin, log string) {
+	t.Helper()
 	dir := t.TempDir()
 	bin, log = filepath.Join(dir, "vault"), filepath.Join(dir, "calls")
 	script := `#!/bin/sh
@@ -74,6 +83,7 @@ if [ "$1 $2" = "token lookup" ]; then
   esac
 fi
 if [ "$1" = login ] && [ "` + lookup + `" = loginfails ]; then exit 2; fi
+if [ "$1 $2" = "print token" ]; then echo "` + printed + `"; fi
 `
 	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
@@ -114,7 +124,7 @@ func TestEnsureLogin(t *testing.T) {
 			var stderr bytes.Buffer
 			a.stderr, a.stdinTTY, a.stderrTTY = &stderr, tc.tty, tc.tty
 			a.stdin = strings.NewReader(tc.answers)
-			a.ensureLogin(loadTestConfig(t, a), tc.context)
+			a.ensureLogin(context.Background(), loadTestConfig(t, a), tc.context)
 
 			calls, _ := os.ReadFile(log)
 			gotLogin := ""
@@ -167,7 +177,7 @@ func TestRememberedLoginUsedNextTime(t *testing.T) {
 	var stderr bytes.Buffer
 	a.stderr, a.stdinTTY, a.stderrTTY = &stderr, true, true
 	a.stdin = strings.NewReader("") // nothing to answer: no questions expected
-	a.ensureLogin(cfg, "dev")
+	a.ensureLogin(context.Background(), cfg, "dev")
 	if calls, _ := os.ReadFile(log); !strings.Contains(string(calls), "login -no-print -method=ldap username=me") {
 		t.Errorf("calls:\n%s\nstderr:\n%s", calls, stderr.String())
 	}
@@ -197,7 +207,7 @@ func TestNoLoginAgainstUnusableServer(t *testing.T) {
 		writeContexts(t, a, map[string]string{"x": addr})
 		var stderr bytes.Buffer
 		a.stderr, a.stdinTTY, a.stderrTTY = &stderr, true, true
-		a.ensureLogin(loadTestConfig(t, a), "x")
+		a.ensureLogin(context.Background(), loadTestConfig(t, a), "x")
 		if calls, _ := os.ReadFile(log); strings.Contains(string(calls), "login") {
 			t.Errorf("%s: logged in anyway: %s", name, calls)
 		}
@@ -217,7 +227,7 @@ func TestExternalTokenNeverLogsIn(t *testing.T) {
 	}
 	var stderr bytes.Buffer
 	a.stderr, a.stdinTTY, a.stderrTTY = &stderr, true, true
-	a.ensureLogin(loadTestConfig(t, a), "x")
+	a.ensureLogin(context.Background(), loadTestConfig(t, a), "x")
 	if calls, _ := os.ReadFile(log); strings.Contains(string(calls), "login") {
 		t.Errorf("logged in although vault uses VAULT_TOKEN: %s", calls)
 	}
@@ -231,6 +241,9 @@ func TestLoginArgsWhitelist(t *testing.T) {
 		"-method oidc -path sso":           {"-method=oidc", "-path=sso"},
 		"-method=userpass\nusername=me":    {"-method=userpass", "username=me"},
 		"--method=ldap username=me role=x": {"-method=ldap", "username=me", "role=x"},
+		"-method=kerberos keytab_path=/etc/krb5.keytab krb5conf_path=/etc/krb5.conf": {
+			"-method=kerberos", "keytab_path=/etc/krb5.keytab", "krb5conf_path=/etc/krb5.conf",
+		},
 	} {
 		got, err := loginArgs(in)
 		if err != nil || !slices.Equal(got, want) {
@@ -252,4 +265,157 @@ func TestVaultError(t *testing.T) {
 	if got := vaultError(out); got != "Code: 503. Vault is sealed" {
 		t.Errorf("got %q", got)
 	}
+	nested := "Code: 403. Errors:\n\n* 2 errors occurred:\n\t* permission denied\n\t* invalid token\n"
+	if got := vaultError(nested); got != "Code: 403. permission denied" {
+		t.Errorf("nested: %q", got)
+	}
+}
+
+func TestCancelAtPrompt(t *testing.T) {
+	bin, log := fakeVault(t, "ok")
+	a, _, _ := newTestApp(t, "VCTX_VAULT_BIN="+bin)
+	writeContexts(t, a, map[string]string{"x": serve(t, vaultHandler(200, activeBody))})
+	r, w, err := os.Pipe() // a real file, as the terminal is: Ctrl-C must interrupt the read
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { r.Close(); w.Close() })
+	var stderr syncBuffer
+	a.stdin, a.stderr, a.stdinTTY, a.stderrTTY = r, &stderr, true, true
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		a.ensureLogin(ctx, loadTestConfig(t, a), "x")
+		close(done)
+	}()
+	for !strings.Contains(stderr.String(), "method [1]") {
+		select {
+		case <-done:
+			t.Fatalf("no question asked:\n%s", stderr.String())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	cancel() // what Ctrl-C does through interruptible
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the question did not give up on Ctrl-C")
+	}
+	if !strings.Contains(stderr.String(), "login cancelled") {
+		t.Errorf("stderr %q", stderr.String())
+	}
+	if calls, _ := os.ReadFile(log); strings.Contains(string(calls), "login") {
+		t.Errorf("logged in after Ctrl-C: %s", calls)
+	}
+}
+
+func TestOwnTokenHelperContext(t *testing.T) {
+	addr := serve(t, vaultHandler(200, activeBody))
+	cfg := "contexts:\n  x:\n    VAULT_ADDR: " + addr + "\n    VAULT_CONFIG_PATH: /etc/vault-cli.hcl\n    login: -method=userpass username=me\n"
+	for _, tc := range []struct {
+		name, lookup, printed string
+		wantLogin             bool
+	}{
+		{"no token there", "ok", "", true},
+		{"working token", "ok", "hvs.x", false},
+		{"expired token", "denied", "hvs.x", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bin, log := fakeVaultPrinting(t, tc.lookup, tc.printed)
+			a, _, _ := newTestApp(t, "VCTX_VAULT_BIN="+bin)
+			if err := os.WriteFile(a.configPath, []byte(cfg), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			a.stderr, a.stdinTTY, a.stderrTTY = &bytes.Buffer{}, true, true
+			a.ensureLogin(context.Background(), loadTestConfig(t, a), "x")
+			calls, _ := os.ReadFile(log)
+			if got := strings.Contains(string(calls), "login -no-print"); got != tc.wantLogin {
+				t.Errorf("login = %v, want %v; calls:\n%s", got, tc.wantLogin, calls)
+			}
+		})
+	}
+}
+
+func TestAgentContextNeverLogsIn(t *testing.T) {
+	bin, log := fakeVault(t, "denied")
+	a, _, _ := newTestApp(t, "VCTX_VAULT_BIN="+bin)
+	addr := serve(t, vaultHandler(200, activeBody))
+	cfg := "contexts:\n  x:\n    VAULT_AGENT_ADDR: " + addr + "\n    login: -method=userpass username=me\n"
+	if err := os.WriteFile(a.configPath, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a.stderr, a.stdinTTY, a.stderrTTY = &bytes.Buffer{}, true, true
+	a.ensureLogin(context.Background(), loadTestConfig(t, a), "x")
+	if calls, _ := os.ReadFile(log); len(calls) > 0 {
+		t.Errorf("vault called for an agent context: %s", calls)
+	}
+}
+
+func TestFailedLoginOffersAnotherMethod(t *testing.T) {
+	bin, log := fakeVault(t, "loginfails")
+	a, _, _ := newTestApp(t, "VCTX_VAULT_BIN="+bin)
+	writeContexts(t, a, map[string]string{"x": serve(t, vaultHandler(200, activeBody))})
+	if err := a.rememberLogin("x", []string{"-method=ldap", "username=me"}); err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	a.stderr, a.stdinTTY, a.stderrTTY = &stderr, true, true
+	a.stdin = strings.NewReader("y\n1\n\nme\nn\n") // pick userpass, then give up
+	a.ensureLogin(context.Background(), loadTestConfig(t, a), "x")
+	calls, _ := os.ReadFile(log)
+	if !strings.Contains(string(calls), "-method=ldap") || !strings.Contains(string(calls), "-method=userpass") {
+		t.Errorf("calls:\n%s\nstderr:\n%s", calls, stderr.String())
+	}
+	if got := a.rememberedLogin("x"); !slices.Equal(got, []string{"-method=ldap", "username=me"}) {
+		t.Errorf("remembered after failures = %q, want unchanged", got)
+	}
+}
+
+func TestLoginFromUIWaitsAfterFailure(t *testing.T) {
+	bin, _ := fakeVault(t, "loginfails")
+	a, _, _ := newTestApp(t, "VCTX_VAULT_BIN="+bin)
+	writeContexts(t, a, map[string]string{"x": serve(t, vaultHandler(200, activeBody))})
+	var out bytes.Buffer
+	l := &loginExec{a: a, cfg: loadTestConfig(t, a), name: "x"}
+	l.SetStdin(strings.NewReader("4\nn\n\n")) // token, no other method, Enter
+	l.SetStdout(&out)
+	if err := l.Run(); err == nil {
+		t.Fatal("failed login reported as success")
+	}
+	if !strings.Contains(out.String(), "press Enter to return") {
+		t.Errorf("output:\n%s", out.String())
+	}
+}
+
+func TestEmptyConfigPathUsesVctxHelper(t *testing.T) {
+	a, out, _ := newTestApp(t)
+	cfg := "defaults:\n  VAULT_CONFIG_PATH: /etc/x.hcl\ncontexts:\n  x:\n    VAULT_ADDR: http://v\n    VAULT_CONFIG_PATH: \"\"\n"
+	if err := os.WriteFile(a.configPath, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.run([]string{"env", "x"}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "VAULT_CONFIG_PATH='"+filepath.Join(a.stateDir, "vault.hcl")+"'") {
+		t.Errorf("output:\n%s", out.String())
+	}
+}
+
+// syncBuffer is a bytes.Buffer safe to read while another goroutine writes.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
 }

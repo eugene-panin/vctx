@@ -217,6 +217,7 @@ func (m *model) update(msg tea.Msg) tea.Cmd {
 		return m.loadTokens()
 	case execDoneMsg:
 		m.current, _ = m.a.contextName("") // `vctx use` may have run in the shell
+		m.rows[msg.i].login = m.a.loginFor(m.cfg, m.rows[msg.i].status.name)
 		if msg.err != nil {
 			m.setFlash(fmt.Sprintf("%s: %v", msg.what, msg.err), false)
 		} else {
@@ -473,7 +474,7 @@ func (m *model) detailView(width, height int) string {
 		b.WriteString(label("status") + m.p.level(lvl).Render(text) + m.p.dim.Render("  "+r.status.latencyText()) + "\n")
 	}
 
-	if args := m.a.loginFor(m.cfg, r.status.name); args != nil {
+	if args := r.login; args != nil {
 		b.WriteString(label("login") + m.p.dim.Render(truncate(strings.Join(args, " "), inner-8)) + "\n")
 	}
 	switch m.tokens[r.status.name] {
@@ -548,9 +549,11 @@ func (a *app) ui() error {
 		return err
 	}
 	if m.chosen != "" {
+		ctx, stop := interruptible()
+		defer stop()
 		a.announceChoice(m.chosen)
 		a.printUsing(m.chosen, cfg)
-		a.ensureLogin(cfg, m.chosen)
+		a.ensureLogin(ctx, cfg, m.chosen)
 	}
 	return nil
 }

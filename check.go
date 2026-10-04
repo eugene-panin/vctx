@@ -105,6 +105,7 @@ type prepared struct {
 	target target
 	// The address could not be resolved: status.err says why, and there is nothing to probe.
 	badAddr bool
+	login   []string // the login method, from the config or remembered
 }
 
 // prepare resolves a context once for probing and for running commands. An
@@ -114,7 +115,7 @@ func (a *app) prepare(cfg *config, name string) (prepared, error) {
 	if err != nil {
 		return prepared{}, err
 	}
-	p := prepared{status: contextStatus{name: name}, vars: vars, env: applyEnv(a.environ, vars)}
+	p := prepared{status: contextStatus{name: name}, vars: vars, env: applyEnv(a.environ, vars), login: a.loginFor(cfg, name)}
 	if p.target, err = targetFor(p.env); err != nil {
 		p.status.display = sanitize(redactAddr(vaultAddr(vars)), 60)
 		p.status.endpoint = p.status.display

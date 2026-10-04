@@ -222,7 +222,7 @@ func (a *app) printUsing(name string, cfg *config) {
 	vars, _ := cfg.vars(name, a.home)
 	addr := redactAddr(vaultAddr(vars))
 	override := a.shellOverride(name)
-	integrated := a.getenv(envChoiceFile) != ""
+	integrated := a.getenv(envChoiceFD) != "" || a.getenv(envChoiceFile) != ""
 	if integrated {
 		override = "" // the shell integration switches this terminal right after
 	}

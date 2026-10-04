@@ -22,8 +22,8 @@ Usage:
   vctx                             interactive UI: status, switch, login, shell
   vctx <context> [vault args...]   run vault against <context>
   vctx exec [<context>] -- cmd     run any command with <context> variables
-  vctx init [--shell zsh|bash|fish] set up your shell once: then 'vctx use'
-                                   switches the terminal and vault follows
+  vctx init [--shell <shell>]      set up zsh, bash or fish once: then 'vctx
+                                   use' switches the terminal, vault follows
   vctx init <shell>                print the integration 'vctx init' loads
   vctx env [<context>|--default]   print exports: eval "$(vctx env prod)"
   vctx env --clear                 print commands that undo 'vctx env'
@@ -56,7 +56,8 @@ Config: $VCTX_CONFIG or $XDG_CONFIG_HOME/vctx/config.yaml (~/.config by default)
 
 When a context has no working token, 'vctx use' and the UI log in. The method
 comes from 'login' (not a variable: the arguments for 'vault login'), or from
-the answers vctx asked for the first time and remembers once the login works.
+the answers vctx asked for the first time and remembers once the login works
+($VCTX_STATE_DIR/login/<context>.json; a failed login offers to pick again).
 vault itself asks for the password or opens the browser, so no secret is kept.
 
 Before running a command vctx calls the unauthenticated sys/health endpoint,
@@ -91,6 +92,9 @@ Environment:
   VCTX_CONTEXT        set for vault and in a 'vctx env' shell: the context
                       (with VCTX_CONTEXT_ADDR, VCTX_CONTEXT_NAMESPACE,
                       VCTX_VARS, VCTX_SAVED_*)
+
+In a terminal that does not answer terminal queries (some ssh or serial
+setups), each command can pause for seconds; TERM=dumb avoids it.
 `
 
 type app struct {
@@ -164,6 +168,7 @@ func newApp() (*app, error) {
 		stderrTTY: isTerminal(os.Stderr),
 		exec:      syscall.Exec,
 	}
+	keepChoiceFD(a.environ)
 	a.configPath = a.getenv("VCTX_CONFIG")
 	if a.configPath == "" {
 		a.configPath = filepath.Join(a.xdgDir("XDG_CONFIG_HOME", ".config"), "vctx", "config.yaml")
@@ -220,12 +225,14 @@ func (a *app) run(args []string) error {
 		if err != nil {
 			return err
 		}
+		ctx, stop := interruptible()
+		defer stop()
 		if err := a.use(cfg, rest[0]); err != nil {
 			return err
 		}
 		a.announceChoice(rest[0])
 		a.printUsing(rest[0], cfg)
-		a.ensureLogin(cfg, rest[0])
+		a.ensureLogin(ctx, cfg, rest[0])
 		return nil
 	case "current":
 		if len(rest) > 0 {
