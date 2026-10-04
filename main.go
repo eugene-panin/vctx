@@ -52,9 +52,10 @@ Config: $VCTX_CONFIG or $XDG_CONFIG_HOME/vctx/config.yaml (~/.config by default)
       VAULT_CACERT: ~/certs/prod-ca.pem
       login: -method=oidc -path=sso
 
-'login' is not a variable: it holds the arguments for 'vault login'. 'vctx use'
-and the UI log in with them when a context has no working token; vault asks for
-the password or opens the browser itself, so no secret goes in the config.
+When a context has no working token, 'vctx use' and the UI log in. The method
+comes from 'login' (not a variable: the arguments for 'vault login'), or from
+the answers vctx asked for the first time and remembers once the login works.
+vault itself asks for the password or opens the browser, so no secret is kept.
 
 Before running a command vctx calls the unauthenticated sys/health endpoint,
 so a VPN or tunnel that is down, or an ingress rejecting your IP, fails in

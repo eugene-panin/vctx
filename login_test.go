@@ -56,8 +56,9 @@ func TestLoginInConfig(t *testing.T) {
 	}
 }
 
-// fakeVault writes a vault stand-in that logs its arguments and answers
-// `token lookup` as lookup says: ok, denied or down.
+// fakeVault writes a vault stand-in that logs its arguments, answers
+// `token lookup` as lookup says (ok, denied or down), and fails `login`
+// when lookup is "loginfails".
 func fakeVault(t *testing.T, lookup string) (bin, log string) {
 	t.Helper()
 	dir := t.TempDir()
@@ -71,6 +72,7 @@ if [ "$1 $2" = "token lookup" ]; then
     *) echo "Error looking up token: dial tcp: connection refused"; exit 2 ;;
   esac
 fi
+if [ "$1" = login ] && [ "` + lookup + `" = loginfails ]; then exit 2; fi
 `
 	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
@@ -83,14 +85,18 @@ func TestEnsureLogin(t *testing.T) {
 	tests := []struct {
 		name, context, lookup string
 		stored, tty           bool
+		answers               string
 		wantLogin, wantInErr  string
+		wantRemembered        bool
 	}{
-		{"no token", "dev", "ok", false, true, "login -no-print -method=userpass username=me", ""},
-		{"working token", "dev", "ok", true, true, "", ""},
-		{"expired token", "dev", "denied", true, true, "login -no-print -method=userpass username=me", ""},
-		{"vault cannot tell", "dev", "down", true, true, "", "check token"},
-		{"no method configured", "bare", "ok", false, true, "", "set `login:`"},
-		{"script", "dev", "ok", false, false, "", ""},
+		{"no token", "dev", "ok", false, true, "", "login -no-print -method=userpass username=me", "", false},
+		{"working token", "dev", "ok", true, true, "", "", "", false},
+		{"expired token", "dev", "denied", true, true, "", "login -no-print -method=userpass username=me", "", false},
+		{"vault cannot tell", "dev", "down", true, true, "", "", "check token", false},
+		{"asks the method", "bare", "ok", false, true, "1\n\nwoodman\n", "login -no-print -method=userpass username=woodman", "", true},
+		{"asks oidc with a path", "bare", "ok", false, true, "3\nsso\n\n", "login -no-print -method=oidc -path=sso", "", true},
+		{"failed login not remembered", "bare", "loginfails", false, true, "2\n\nme\n", "login -no-print -method=ldap username=me", "login failed", false},
+		{"script", "dev", "ok", false, false, "", "", "", false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -104,6 +110,7 @@ func TestEnsureLogin(t *testing.T) {
 			}
 			var stderr bytes.Buffer
 			a.stderr, a.stdinTTY, a.stderrTTY = &stderr, tc.tty, tc.tty
+			a.stdin = strings.NewReader(tc.answers)
 			a.ensureLogin(loadTestConfig(t, a), tc.context)
 
 			calls, _ := os.ReadFile(log)
@@ -118,6 +125,10 @@ func TestEnsureLogin(t *testing.T) {
 			}
 			if tc.wantInErr != "" && !strings.Contains(stderr.String(), tc.wantInErr) {
 				t.Errorf("stderr %q, want %q", stderr.String(), tc.wantInErr)
+			}
+			_, err := os.Stat(a.rememberedLoginPath(tc.context))
+			if remembered := err == nil; remembered != tc.wantRemembered {
+				t.Errorf("remembered = %v, want %v", remembered, tc.wantRemembered)
 			}
 		})
 	}
@@ -136,5 +147,40 @@ func TestDetailShowsLogin(t *testing.T) {
 	m.Update(tea.WindowSizeMsg{Width: 150, Height: 30})
 	if view := m.View(); !strings.Contains(view, "-method=oidc -path=sso") {
 		t.Errorf("details:\n%s", view)
+	}
+}
+
+func TestRememberedLoginUsedNextTime(t *testing.T) {
+	bin, log := fakeVault(t, "denied")
+	a, _, _ := newTestApp(t, "VCTX_VAULT_BIN="+bin)
+	if err := a.rememberLogin("dev", []string{"-method=ldap", "username=me"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := loadTestConfig(t, a)
+	if got := a.loginFor(cfg, "dev"); !slices.Equal(got, []string{"-method=ldap", "username=me"}) {
+		t.Errorf("loginFor = %q", got)
+	}
+	var stderr bytes.Buffer
+	a.stderr, a.stdinTTY, a.stderrTTY = &stderr, true, true
+	a.stdin = strings.NewReader("") // nothing to answer: no questions expected
+	a.ensureLogin(cfg, "dev")
+	if calls, _ := os.ReadFile(log); !strings.Contains(string(calls), "login -no-print -method=ldap username=me") {
+		t.Errorf("calls:\n%s\nstderr:\n%s", calls, stderr.String())
+	}
+}
+
+func TestLoginFromUI(t *testing.T) {
+	bin, log := fakeVault(t, "ok")
+	a, _, _ := newTestApp(t, "VCTX_VAULT_BIN="+bin)
+	var out bytes.Buffer
+	l := &loginExec{a: a, cfg: loadTestConfig(t, a), name: "dev"}
+	l.SetStdin(strings.NewReader("4\n"))
+	l.SetStdout(&out)
+	l.SetStderr(&out)
+	if err := l.Run(); err != nil {
+		t.Fatalf("%v\n%s", err, out.String())
+	}
+	if calls, _ := os.ReadFile(log); !strings.Contains(string(calls), "login -no-print -method=token") {
+		t.Errorf("calls:\n%s", calls)
 	}
 }
