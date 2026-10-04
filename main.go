@@ -19,16 +19,16 @@ import (
 const usage = `vctx - switch between several Vault instances by environment variables.
 
 Usage:
-  vctx                               interactive UI: status, switch, login, shell
-  vctx <context> [vault args...]     run vault against <context>
-  vctx exec [<context>] -- cmd ...   run any command with <context> variables
-  vctx env [<context>]               print shell exports: eval "$(vctx env prod)"
-  vctx env --clear                   print commands that undo 'vctx env' in a shell
-  vctx use [<context>]               set the default context (UI without a name)
-  vctx current                       print the active context
-  vctx ls                            list contexts
-  vctx check [<context>...]          show reachability, version and seal status
-  vctx logout [<context>]            forget the stored token of <context>
+  vctx                             interactive UI: status, switch, login, shell
+  vctx <context> [vault args...]   run vault against <context>
+  vctx exec [<context>] -- cmd     run any command with <context> variables
+  vctx env [<context>]             print exports: eval "$(vctx env prod)"
+  vctx env --clear                 print commands that undo 'vctx env'
+  vctx use [<context>]             set the default context (UI without a name)
+  vctx current                     print the active context
+  vctx ls                          list contexts
+  vctx check [<context>...]        show reachability, version and seal status
+  vctx logout [<context>]          forget the stored token of <context>
 
 The context is taken from the explicit name, then $VCTX_CONTEXT,
 then the default set by 'vctx use'.
@@ -58,12 +58,13 @@ nothing stops them, so do not pass them there. Other variables a context sets,
 PATH or HTTPS_PROXY say, get your own values back when you switch away.
 
 Tokens from 'vault login' are stored per context and bound to the address
-they were issued for: in the macOS Keychain by default, in files under
-$VCTX_STATE_DIR/tokens (default $XDG_STATE_HOME/vctx, ~/.local/state/vctx) elsewhere; set
-VCTX_TOKEN_STORE=file or keychain to choose. The Keychain keeps tokens off disk
-and out of backups, but like a 0600 file it does not hide them from other
-programs running as you. vctx sets VAULT_CONFIG_PATH to a generated config
-that registers vctx itself as the Vault token helper.
+they were issued for: in the macOS Keychain by default, elsewhere in files
+under $VCTX_STATE_DIR/tokens (default $XDG_STATE_HOME/vctx, that is
+~/.local/state/vctx); VCTX_TOKEN_STORE=file or keychain chooses. The
+Keychain keeps tokens off disk and out of backups, but like a 0600 file it
+does not hide them from other programs running as you. vctx sets
+VAULT_CONFIG_PATH to a generated config that registers vctx itself as the
+Vault token helper.
 
 The config and the state directory must not be writable by other users.
 
@@ -73,7 +74,8 @@ Environment:
   VCTX_TOKEN_STORE    file or keychain
   VCTX_CHECK_TIMEOUT  reachability check timeout, 0 disables it
   VCTX_VAULT_BIN      vault binary to run (default: vault on PATH)
-  VCTX_CONTEXT        set by 'vctx env': this shell's context
+  VCTX_CONTEXT        set by 'vctx env': this shell's context (and
+                      VCTX_CONTEXT_ADDR, VCTX_VARS, VCTX_SAVED_*)
 `
 
 type app struct {

@@ -17,8 +17,13 @@ func isHelperOp(s string) bool {
 // tokenKey picks the token for the calling vault process: by context when
 // vault was started through vctx, otherwise by address and namespace. The "_"
 // prefix cannot start a context name, so the two kinds of keys never collide.
+//
+// In a shell set up with `vctx env`, VAULT_ADDR changed by hand points vault
+// away from the context; its token then goes under the address key, so it
+// neither replaces nor erases the context's own.
 func (a *app) tokenKey() string {
-	if name := a.getenv(envContext); nameRe.MatchString(name) {
+	name, ctxAddr := a.getenv(envContext), a.getenv(envContextAddr)
+	if nameRe.MatchString(name) && (ctxAddr == "" || ctxAddr == a.callerAddr()) {
 		return name
 	}
 	sum := sha256.Sum256([]byte(a.callerAddr() + "\x00" + a.getenv("VAULT_NAMESPACE")))
@@ -53,9 +58,13 @@ func (a *app) tokenHelper(op string) error {
 		_, err = io.WriteString(a.stdout, token)
 		return err
 	case "store":
-		b, err := io.ReadAll(io.LimitReader(a.stdin, 64<<10))
+		const maxToken = 64 << 10
+		b, err := io.ReadAll(io.LimitReader(a.stdin, maxToken+1))
 		if err != nil {
 			return fmt.Errorf("read token: %w", err)
+		}
+		if len(b) > maxToken {
+			return fmt.Errorf("token larger than %d bytes", maxToken)
 		}
 		token := strings.TrimSpace(string(b))
 		if token == "" {

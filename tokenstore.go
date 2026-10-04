@@ -121,6 +121,16 @@ type keychainStore struct {
 	kr      secretService
 	addrDir string
 	legacy  fileStore
+	// oldAddrDir held address records in the version before addrDir; they
+	// are not trusted, only removed when the token they describe changes.
+	oldAddrDir string
+}
+
+func (s keychainStore) removeOldRecord(key string) error {
+	if err := os.Remove(filepath.Join(s.oldAddrDir, filepath.FromSlash(key))); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 func (s keychainStore) addrPath(key string) string {
@@ -178,6 +188,9 @@ func (s keychainStore) set(key, token, addr string) error {
 		}
 		return keychainError(err)
 	}
+	if err := s.removeOldRecord(key); err != nil {
+		return err
+	}
 	return s.legacy.del(key)
 }
 
@@ -186,6 +199,9 @@ func (s keychainStore) del(key string) error {
 		return keychainError(err)
 	}
 	if err := os.Remove(s.addrPath(key)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	if err := s.removeOldRecord(key); err != nil {
 		return err
 	}
 	return s.legacy.del(key)
@@ -210,7 +226,12 @@ func (a *app) tokens() (tokenStore, error) {
 		if kr == nil {
 			kr = systemKeyring{}
 		}
-		return keychainStore{kr: kr, addrDir: filepath.Join(a.stateDir, "keychain-addrs"), legacy: files}, nil
+		return keychainStore{
+			kr:         kr,
+			addrDir:    filepath.Join(a.stateDir, "keychain-addrs"),
+			legacy:     files,
+			oldAddrDir: filepath.Join(a.stateDir, "addrs"),
+		}, nil
 	}
 	return nil, fmt.Errorf("invalid VCTX_TOKEN_STORE %q, want file or keychain", kind)
 }
@@ -220,7 +241,7 @@ type tokenState int
 const (
 	tokenNone  tokenState = iota
 	tokenOK               // stored for the context's current address
-	tokenStale            // stored for another address, or none: vault will not get it
+	tokenStale            // stored for another address, or without one: vault will not get it
 )
 
 // tokenStatus reports the stored token of each context; on error the map

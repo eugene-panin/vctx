@@ -65,10 +65,16 @@ func loadConfig(path string) (*config, error) {
 	if err := checkVars(c.Defaults); err != nil {
 		return nil, fmt.Errorf("%s: defaults: %w", path, err)
 	}
+	seen := make(map[string]string, len(c.Contexts))
 	for _, name := range slices.Sorted(maps.Keys(c.Contexts)) {
 		if !nameRe.MatchString(name) || slices.Contains(reservedNames, name) {
 			return nil, fmt.Errorf("%s: invalid context name %q", path, name)
 		}
+		// Names become file names, and macOS file systems ignore case by default.
+		if other, dup := seen[strings.ToLower(name)]; dup {
+			return nil, fmt.Errorf("%s: context names %q and %q differ only in case", path, other, name)
+		}
+		seen[strings.ToLower(name)] = name
 		if err := checkVars(c.Contexts[name]); err != nil {
 			return nil, fmt.Errorf("%s: context %s: %w", path, name, err)
 		}

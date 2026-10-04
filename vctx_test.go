@@ -30,6 +30,22 @@ func (a *app) tokenPath(name string) string {
 	return filepath.Join(a.stateDir, "tokens", name)
 }
 
+// helperRunner returns a function that runs a token helper operation the way
+// vault does: env on top of the app's environment, input on stdin. It returns stdout.
+func helperRunner(t *testing.T, a *app, out *bytes.Buffer) func(op, input string, env ...string) string {
+	base := a.environ
+	return func(op, input string, env ...string) string {
+		t.Helper()
+		out.Reset()
+		a.environ = withEnv(base, env...)
+		a.stdin = strings.NewReader(input)
+		if err := a.run([]string{op}); err != nil {
+			t.Fatalf("%s: %v", op, err)
+		}
+		return out.String()
+	}
+}
+
 // withEnv returns env with kvs taking precedence; the first occurrence of a key wins.
 func withEnv(env []string, kvs ...string) []string {
 	return append(slices.Clip(kvs), env...)
@@ -59,6 +75,7 @@ func newTestApp(t *testing.T, environ ...string) (*app, *bytes.Buffer, *execCall
 		stdin:      strings.NewReader(""),
 		stdout:     &out,
 		stderr:     &bytes.Buffer{},
+		keyring:    newFakeKeyring(), // a test must never reach the real keychain
 		exec: func(argv0 string, argv, env []string) error {
 			*call = execCall{argv0, argv, env}
 			return nil
@@ -188,16 +205,7 @@ func TestTokenHelperIsolation(t *testing.T) {
 	a, out, _ := newTestApp(t)
 	base := a.environ
 
-	helper := func(op, input string, env ...string) string {
-		t.Helper()
-		out.Reset()
-		a.environ = withEnv(base, env...)
-		a.stdin = strings.NewReader(input)
-		if err := a.run([]string{op}); err != nil {
-			t.Fatal(err)
-		}
-		return out.String()
-	}
+	helper := helperRunner(t, a, out)
 
 	helper("store", "tok-dev\n", "VCTX_CONTEXT=dev")
 	helper("store", "tok-prod", "VCTX_CONTEXT=prod")
@@ -254,16 +262,7 @@ func TestVaultConfigRejectsUnsafePath(t *testing.T) {
 func TestTokenBoundToAddress(t *testing.T) {
 	a, out, _ := newTestApp(t)
 	base := a.environ
-	helper := func(op, input string, env ...string) string {
-		t.Helper()
-		out.Reset()
-		a.environ = withEnv(base, env...)
-		a.stdin = strings.NewReader(input)
-		if err := a.run([]string{op}); err != nil {
-			t.Fatal(err)
-		}
-		return out.String()
-	}
+	helper := helperRunner(t, a, out)
 
 	helper("store", "tok", "VCTX_CONTEXT=dev", "VAULT_ADDR=https://vault.example.com/")
 	if got := helper("get", "", "VCTX_CONTEXT=dev", "VAULT_ADDR=https://vault.example.com"); got != "tok" {
@@ -360,41 +359,21 @@ func TestPrivatePaths(t *testing.T) {
 
 func TestLoginAfterAddressChange(t *testing.T) {
 	a, out, _ := newTestApp(t)
-	base := a.environ
-	helper := func(op, input, addr string) string {
-		t.Helper()
-		out.Reset()
-		a.environ = withEnv(base, "VCTX_CONTEXT=dev", "VAULT_ADDR="+addr)
-		a.stdin = strings.NewReader(input)
-		if err := a.run([]string{op}); err != nil {
-			t.Fatalf("%s at %s: %v", op, addr, err)
-		}
-		return out.String()
-	}
-	helper("store", "old", "https://old.example.com")
+	helper := helperRunner(t, a, out)
+	helper("store", "old", "VCTX_CONTEXT=dev", "VAULT_ADDR=https://old.example.com")
 	// vault login asks for the current token before storing the new one.
-	if got := helper("get", "", "https://new.example.com"); got != "" {
+	if got := helper("get", "", "VCTX_CONTEXT=dev", "VAULT_ADDR=https://new.example.com"); got != "" {
 		t.Errorf("old token offered to the new address: %q", got)
 	}
-	helper("store", "new", "https://new.example.com")
-	if got := helper("get", "", "https://new.example.com"); got != "new" {
+	helper("store", "new", "VCTX_CONTEXT=dev", "VAULT_ADDR=https://new.example.com")
+	if got := helper("get", "", "VCTX_CONTEXT=dev", "VAULT_ADDR=https://new.example.com"); got != "new" {
 		t.Errorf("after login: %q", got)
 	}
 }
 
 func TestAddressAndContextTokensApart(t *testing.T) {
 	a, out, _ := newTestApp(t)
-	base := a.environ
-	run := func(op, input string, env ...string) string {
-		t.Helper()
-		out.Reset()
-		a.environ = withEnv(base, env...)
-		a.stdin = strings.NewReader(input)
-		if err := a.run([]string{op}); err != nil {
-			t.Fatal(err)
-		}
-		return out.String()
-	}
+	run := helperRunner(t, a, out)
 	addr := "VAULT_ADDR=https://vault.example.com"
 	run("store", "by-address", addr)
 	run("store", "by-context", addr, "VCTX_CONTEXT=addr")
@@ -652,5 +631,41 @@ func TestFlagsAreUsageErrors(t *testing.T) {
 		if err := a.run(args); !errors.As(err, &uerr) {
 			t.Errorf("%q: err = %v, want a usage error", args, err)
 		}
+	}
+}
+
+// In a context shell, vault pointed elsewhere by hand must not replace or
+// erase the context's own token.
+func TestHandChangedAddressKeepsContextToken(t *testing.T) {
+	a, out, _ := newTestApp(t)
+	helper := helperRunner(t, a, out)
+	ctx := []string{"VCTX_CONTEXT=dev", "VCTX_CONTEXT_ADDR=http://127.0.0.1:8201"}
+	helper("store", "dev-token", append(ctx, "VAULT_ADDR=http://127.0.0.1:8201")...)
+	helper("store", "other-token", append(ctx, "VAULT_ADDR=http://other:8200")...)
+	helper("erase", "", append(ctx, "VAULT_ADDR=http://other:8200")...)
+	if got := helper("get", "", append(ctx, "VAULT_ADDR=http://127.0.0.1:8201")...); got != "dev-token" {
+		t.Errorf("context token = %q", got)
+	}
+}
+
+func TestContextNamesDifferingInCase(t *testing.T) {
+	a, _, _ := newTestApp(t)
+	cfg := "contexts:\n  Team:\n    VAULT_ADDR: http://a\n  team:\n    VAULT_ADDR: http://b\n"
+	if err := os.WriteFile(a.configPath, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.run([]string{"ls"}); err == nil || !strings.Contains(err.Error(), "differ only in case") {
+		t.Errorf("err = %v", err)
+	}
+}
+
+func TestTokenTooLarge(t *testing.T) {
+	a, _, _ := newTestApp(t, "VCTX_CONTEXT=dev")
+	a.stdin = strings.NewReader(strings.Repeat("t", 64<<10+1))
+	if err := a.run([]string{"store"}); err == nil || !strings.Contains(err.Error(), "larger than") {
+		t.Errorf("err = %v", err)
+	}
+	if _, err := os.Stat(a.tokenPath("dev")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("a cut token was stored: %v", err)
 	}
 }

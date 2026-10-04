@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"crypto/tls"
 	"encoding/pem"
 	"io"
@@ -531,5 +532,44 @@ func TestProxyCannotReachUpstream(t *testing.T) {
 	r := probeEnv(t, []string{"VAULT_ADDR=https://vault.example.com", "VAULT_PROXY_ADDR=" + proxy})
 	if short, long := classify(r.err); short != "proxy can't reach" || !strings.Contains(long, "cannot reach") || !networkProblem(r.err) {
 		t.Errorf("short %q, long %q", short, long)
+	}
+}
+
+// rawProxy answers every CONNECT with statusLine, as proxies with their own
+// reason phrases do ("504 Gateway Time-out" from nginx, "502 Proxy Error" from Apache).
+func rawProxy(t *testing.T, statusLine string) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				http.ReadRequest(bufio.NewReader(conn))
+				io.WriteString(conn, "HTTP/1.1 "+statusLine+"\r\nContent-Length: 0\r\n\r\n")
+			}()
+		}
+	}()
+	return "http://" + ln.Addr().String()
+}
+
+func TestProxyStatusCodes(t *testing.T) {
+	for line, want := range map[string]string{
+		"504 Gateway Time-out":              "proxy can't reach",
+		"502 Proxy Error":                   "proxy can't reach",
+		"503 ":                              "proxy can't reach",
+		"407 Proxy Authentication Required": "blocked by proxy",
+	} {
+		r := probeEnv(t, []string{"VAULT_ADDR=https://vault.example.com", "VAULT_PROXY_ADDR=" + rawProxy(t, line)})
+		if short, long := classify(r.err); short != want {
+			t.Errorf("%q: short %q, long %q", line, short, long)
+		}
 	}
 }

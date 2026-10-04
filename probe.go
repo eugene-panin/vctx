@@ -254,28 +254,24 @@ type notVaultError struct {
 }
 
 // proxyError is a proxy answering CONNECT with anything but 200: refusing the
-// tunnel (403, 407) or failing to reach Vault itself (502, 504).
+// tunnel (403, 407) or failing to reach Vault itself (502, 503, 504).
 type proxyError struct {
-	proxy string
-	err   error // net/http keeps only the status text
+	proxy  string
+	status string // as sent, e.g. "504 Gateway Time-out"
+	code   int
 }
 
 // upstream reports a proxy that accepted the tunnel but could not reach the server.
 func (e *proxyError) upstream() bool {
-	switch e.err.Error() {
-	case "Bad Gateway", "Service Unavailable", "Gateway Timeout":
-		return true
-	}
-	return false
+	return e.code == http.StatusBadGateway || e.code == http.StatusServiceUnavailable || e.code == http.StatusGatewayTimeout
 }
 
 func (e *proxyError) Error() string {
 	if e.upstream() {
-		return "proxy " + e.proxy + " cannot reach the server: " + e.err.Error()
+		return "proxy " + e.proxy + " cannot reach the server: " + e.status
 	}
-	return "proxy " + e.proxy + " refused: " + e.err.Error()
+	return "proxy " + e.proxy + " refused: " + e.status
 }
-func (e *proxyError) Unwrap() error { return e.err }
 
 func (e *notVaultError) Error() string {
 	if e.location != "" {
@@ -316,7 +312,14 @@ func probe(ctx context.Context, t target, env []string, timeout time.Duration) p
 		return probeResult{err: &configError{err}}
 	}
 	tr := &http.Transport{
-		Proxy:             func(*http.Request) (*url.URL, error) { return t.proxy, nil },
+		Proxy: func(*http.Request) (*url.URL, error) { return t.proxy, nil },
+		// net/http reports a failed CONNECT only by its status text; keep the code.
+		OnProxyConnectResponse: func(_ context.Context, proxy *url.URL, _ *http.Request, resp *http.Response) error {
+			if resp.StatusCode == http.StatusOK {
+				return nil
+			}
+			return &proxyError{proxy: proxy.Host, status: sanitize(resp.Status, 60), code: resp.StatusCode}
+		},
 		TLSClientConfig:   tlsCfg,
 		DisableKeepAlives: true,
 		ForceAttemptHTTP2: true,
@@ -342,7 +345,7 @@ func probe(ctx context.Context, t target, env []string, timeout time.Duration) p
 	start := time.Now()
 	resp, err := client.Do(req)
 	if err != nil {
-		return probeResult{err: proxyRefusal(t, err)}
+		return probeResult{err: err}
 	}
 	defer resp.Body.Close()
 	latency := time.Since(start)
@@ -368,20 +371,6 @@ func probe(ctx context.Context, t target, env []string, timeout time.Duration) p
 		notVault.location = sanitize(loc.Host, 60)
 	}
 	return probeResult{err: notVault}
-}
-
-// proxyRefusal recognizes a failed CONNECT: net/http reports it only as the
-// proxy's status text ("Forbidden"), with no type of its own. Anything else
-// with a classification of its own is left alone.
-func proxyRefusal(t target, err error) error {
-	var urlErr *url.Error
-	if t.proxy == nil || !errors.As(err, &urlErr) {
-		return err
-	}
-	if short, _ := classify(err); short != "error" {
-		return err
-	}
-	return &proxyError{proxy: t.proxy.Host, err: urlErr.Err}
 }
 
 // notTLS matches a TLS client talking to a plain HTTP server; net/http reports
