@@ -1,6 +1,10 @@
 version: 2
 project_name: vctx
 
+before:
+  hooks:
+    - sh -c 'mkdir -p completions && for s in bash zsh fish; do go run . completion "$s" > "completions/vctx.$s"; done'
+
 builds:
   - main: .
     binary: vctx
@@ -19,6 +23,7 @@ archives:
     files:
       - LICENSE
       - README.md
+      - completions/*
 
 checksum:
   name_template: checksums.txt
@@ -36,6 +41,10 @@ homebrew_casks:
     homepage: https://github.com/eugene-panin/vctx
     description: Switch the Vault CLI between several Vault instances
     license: MIT
+    completions:
+      bash: completions/vctx.bash
+      zsh: completions/vctx.zsh
+      fish: completions/vctx.fish
     caveats: |
       Put your Vault instances in ~/.config/vctx/config.yaml (format: vctx help),
       then run once: vctx init

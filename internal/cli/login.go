@@ -19,6 +19,6 @@ func (a *app) loginRunner(timeout time.Duration) *login.Runner {
 		Tokens:      a.tokens,
 		In:          a.stdin,
 		Out:         a.stderr,
-		Interactive: a.stdinTTY && a.stderrTTY,
+		Interactive: a.stdinTTY && a.stderrTTY && !a.noInput,
 	}
 }

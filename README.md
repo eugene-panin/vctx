@@ -35,7 +35,9 @@ With Go 1.26 or newer:
 go install github.com/eugene-panin/vctx@latest
 ```
 
-The binary ends up in `$(go env GOPATH)/bin`, usually `~/go/bin`.
+The binary ends up in `$(go env GOPATH)/bin`, usually `~/go/bin`. Homebrew
+also installs shell completion for commands and context names; with Go, set it
+up with `vctx completion zsh` (or bash, fish), see `vctx completion -h`.
 
 vctx runs the `vault` binary it finds on `PATH` (or `$VCTX_VAULT_BIN`). It
 does not replace or bundle it.
@@ -160,8 +162,6 @@ these deliberate exceptions:
 - `vctx <context> [vault args...]` treats any word that is not a command as a
   context. That shortcut is the point of the tool; a context named like a
   command is rejected when the config is loaded.
-- The command line is parsed by hand rather than with a parser library: after
-  a context name every argument, `-h` included, belongs to vault untouched.
 - `vctx logout` does not ask for confirmation: it only forgets a token, which
   the next login brings back.
 - `vctx init` appends to your rc file without asking: that is all it is run

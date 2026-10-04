@@ -4,9 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
-	"go/ast"
-	"go/parser"
-	gotoken "go/token"
 	"os"
 	"path/filepath"
 	"slices"
@@ -84,52 +81,14 @@ func newTestApp(t *testing.T, environ ...string) (*app, *bytes.Buffer, *execCall
 	return a, &out, call
 }
 
+// A context named like a command could never run as 'vctx <context>'.
 func TestContextNameIsNoCommand(t *testing.T) {
-	a, _, _ := newTestApp(t)
-	writeContexts(t, a, map[string]string{"env": "http://v"})
-	if _, err := a.loadConfig(); err == nil || !strings.Contains(err.Error(), "is a vctx command") {
-		t.Errorf("err = %v", err)
-	}
-}
-
-// commands must list every subcommand run dispatches on: a context named
-// like a new one would no longer run with "vctx <context>".
-func TestCommandsListsEverySubcommand(t *testing.T) {
-	f, err := parser.ParseFile(gotoken.NewFileSet(), "app.go", nil, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var cases []string
-	ast.Inspect(f, func(n ast.Node) bool {
-		fn, ok := n.(*ast.FuncDecl)
-		if !ok || fn.Name.Name != "run" {
-			return true
+	for _, name := range []string{"env", "list", "get", "help", "completion"} {
+		a, _, _ := newTestApp(t)
+		writeContexts(t, a, map[string]string{name: "http://v"})
+		if _, err := a.loadConfig(); err == nil || !strings.Contains(err.Error(), "is a vctx command") {
+			t.Errorf("%s: err = %v", name, err)
 		}
-		ast.Inspect(fn.Body, func(n ast.Node) bool {
-			if cc, ok := n.(*ast.CaseClause); ok {
-				for _, e := range cc.List {
-					if lit, ok := e.(*ast.BasicLit); ok && lit.Kind == gotoken.STRING {
-						cases = append(cases, strings.Trim(lit.Value, `"`))
-					}
-				}
-			}
-			return true
-		})
-		return false
-	})
-	if len(cases) == 0 {
-		t.Fatal("no subcommands found in run")
-	}
-	for _, op := range []string{"get", "store", "erase"} {
-		if !token.IsHelperOp(op) {
-			t.Errorf("%s is no token helper operation", op)
-		}
-		cases = append(cases, op)
-	}
-	slices.Sort(cases)
-	want := slices.Sorted(slices.Values(commands))
-	if !slices.Equal(cases, want) {
-		t.Errorf("run dispatches on %q, commands lists %q", cases, want)
 	}
 }
 
@@ -303,21 +262,27 @@ func TestPrivatePaths(t *testing.T) {
 	}
 }
 
-func TestSplitExec(t *testing.T) {
+func TestExecForms(t *testing.T) {
 	tests := []struct {
 		args     []string
-		name     string
 		wantArgv []string
+		wantNS   bool // prod's namespace, not the default dev's
 	}{
-		{[]string{"--", "vault", "status"}, "", []string{"vault", "status"}},
-		{[]string{"prod", "--", "vault"}, "prod", []string{"vault"}},
-		{[]string{"prod", "vault"}, "prod", []string{"vault"}},
-		{nil, "", nil},
+		{[]string{"exec", "--", "vault", "status"}, []string{"vault", "status"}, false},
+		{[]string{"exec", "prod", "--", "vault", "-x"}, []string{"vault", "-x"}, true},
+		{[]string{"exec", "prod", "sh", "-c", "true"}, []string{"sh", "-c", "true"}, true},
 	}
 	for _, tc := range tests {
-		name, argv := splitExec(tc.args)
-		if name != tc.name || !slices.Equal(argv, tc.wantArgv) {
-			t.Errorf("%q: got %q %q", tc.args, name, argv)
+		a, _, call := newTestApp(t, "VCTX_VAULT_BIN=vault")
+		if err := a.run([]string{"use", "dev"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := a.run(tc.args); err != nil {
+			t.Errorf("%q: %v", tc.args, err)
+			continue
+		}
+		if !slices.Equal(call.argv, tc.wantArgv) || slices.Contains(call.env, "VAULT_NAMESPACE=admin") != tc.wantNS {
+			t.Errorf("%q: argv %q, env %q", tc.args, call.argv, call.env)
 		}
 	}
 }
@@ -452,7 +417,7 @@ func TestHelpWinsOverEverything(t *testing.T) {
 		if cmd == "list" {
 			cmd = "ls"
 		}
-		if !strings.HasPrefix(out.String(), "usage: vctx "+cmd) || call.argv0 != "" {
+		if !strings.Contains(out.String(), "Usage:\n  vctx "+cmd) || call.argv0 != "" {
 			t.Errorf("%q printed:\n%s", args, out)
 		}
 	}
@@ -469,12 +434,10 @@ func TestHelpAfterDashDashBelongsToCommand(t *testing.T) {
 }
 
 func TestEveryCommandHasHelp(t *testing.T) {
-	for _, cmd := range commands {
-		if strings.HasPrefix(cmd, "-") || cmd == "help" || cmd == "list" || token.IsHelperOp(cmd) {
-			continue
-		}
-		if _, ok := commandHelp[cmd]; !ok {
-			t.Errorf("no help for %s", cmd)
+	a, _, _ := newTestApp(t)
+	for _, c := range a.rootCmd(nil).Commands() {
+		if c.Short == "" || !c.Hidden && c.Name() != "version" && c.Long == "" {
+			t.Errorf("%s has no help", c.Name())
 		}
 	}
 }
@@ -608,5 +571,49 @@ func TestLogoutInContextShellForgetsVaultsToken(t *testing.T) {
 	}
 	if got := helper("get", "", append(ctx, "VAULT_ADDR=http://127.0.0.1:8201")...); got != "dev-token" {
 		t.Errorf("context token = %q", got)
+	}
+}
+
+func TestCompletion(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		want []string
+	}{
+		{[]string{"__complete", "use", ""}, []string{"dev", "prod"}},
+		{[]string{"__complete", "check", "dev", ""}, []string{"prod"}},
+		{[]string{"__complete", ""}, []string{"dev", "prod", "use", "check"}},
+		{[]string{"__complete", "env", "--shell", ""}, []string{"posix", "fish"}},
+	} {
+		a, out, _ := newTestApp(t)
+		if err := a.run(tc.args); err != nil {
+			t.Fatalf("%q: %v", tc.args, err)
+		}
+		// One candidate per line, "name" or "name\tdescription"; ":<directive>" last.
+		var got []string
+		for _, line := range strings.Split(out.String(), "\n") {
+			if name, _, _ := strings.Cut(line, "\t"); name != "" && !strings.HasPrefix(name, ":") {
+				got = append(got, name)
+			}
+		}
+		for _, w := range tc.want {
+			if !slices.Contains(got, w) {
+				t.Errorf("%q: %q missing in %q", tc.args, w, got)
+			}
+		}
+	}
+}
+
+func TestVersion(t *testing.T) {
+	for _, args := range [][]string{{"--version"}, {"version"}} {
+		a, out, _ := newTestApp(t)
+		a.version = "v1.2.3"
+		if err := a.run(args); err != nil || out.String() != "vctx v1.2.3\n" {
+			t.Errorf("%q: %q, %v", args, out, err)
+		}
+	}
+	a, _, _ := newTestApp(t)
+	var uerr usageError
+	if err := a.run([]string{"-v"}); !errors.As(err, &uerr) {
+		t.Errorf("-v: %v", err)
 	}
 }

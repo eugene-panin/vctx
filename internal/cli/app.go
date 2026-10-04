@@ -17,103 +17,10 @@ import (
 
 	"github.com/eugene-panin/vctx/internal/config"
 	"github.com/eugene-panin/vctx/internal/environ"
-	"github.com/eugene-panin/vctx/internal/login"
 	"github.com/eugene-panin/vctx/internal/safefile"
 	"github.com/eugene-panin/vctx/internal/shell"
 	"github.com/eugene-panin/vctx/internal/token"
 )
-
-const usage = `vctx - switch between several Vault instances by environment variables.
-
-Examples:
-  vctx use prod                    switch this terminal to prod, logging in if needed
-  vault kv get secret/app          plain vault follows (after 'vctx init' once)
-  vctx dev kv get secret/app       one command against dev, without switching
-  vctx check                       which instances are reachable
-
-Usage:
-  vctx                             interactive UI: status, switch, login, shell
-  vctx <context> [vault args...]   run vault against <context>
-  vctx exec [<context>] -- cmd     run any command with <context> variables
-  vctx init [--shell <shell>]      set up zsh, bash or fish once: then 'vctx
-                                   use' switches the terminal, vault follows
-  vctx init <shell>                print the integration 'vctx init' loads
-  vctx env [<context>|--default]   print exports: eval "$(vctx env prod)"
-  vctx env --clear                 print commands that undo 'vctx env'
-  vctx env ... --shell fish        the same in fish syntax
-  vctx use [<context>]             switch to <context>, logging in if needed
-                                   (the UI without a name)
-  vctx current                     print the active context
-  vctx ls [--json]                 list contexts
-  vctx check [--json] [<ctx>...]   show reachability, version and seal status
-  vctx logout [<context>]          forget the stored token of <context>, or
-                                   in a context shell the one vault uses
-  vctx version                     print the vctx version
-
-'vctx <command> -h' shows the help of a command.
-
-The context is taken from the explicit name, then $VCTX_CONTEXT,
-then the default set by 'vctx use'.
-
-Config: $VCTX_CONFIG or $XDG_CONFIG_HOME/vctx/config.yaml (~/.config by default)
-
-  defaults:                  # applied to every context
-    VAULT_FORMAT: json
-  contexts:
-    dev:
-      VAULT_ADDR: https://vault.dev.example.com:8200
-      VAULT_SKIP_VERIFY: "true"
-      login: -method=userpass username=me
-    prod:
-      VAULT_ADDR: https://vault.example.com:8200
-      VAULT_NAMESPACE: admin
-      VAULT_CACERT: ~/certs/prod-ca.pem
-      login: -method=oidc -path=sso
-
-When a context has no working token, 'vctx use' and the UI log in. The method
-comes from 'login' (not a variable: the arguments for 'vault login'), or from
-the answers vctx asked for the first time and remembers once the login works
-($VCTX_STATE_DIR/login/<context>.json; a failed login offers to pick again).
-vault itself asks for the password or opens the browser, so no secret is kept.
-
-Before running a command vctx calls the unauthenticated sys/health endpoint,
-so a VPN or tunnel that is down, or an ingress rejecting your IP, fails in
-seconds. VCTX_CHECK_TIMEOUT sets the timeout (default 3s); 0 skips the check
-before commands, while 'vctx check' and the UI still probe, with 3s.
-
-Inherited VAULT_* variables are dropped before a context is applied, so an
-address or token of one instance never leaks into another. vctx refuses vault's
--address and -agent-address flags: the token helper cannot see them and would
-hand the context's token to that server. In a shell set up with 'vctx env'
-nothing stops them, so do not pass them there. Other variables a context sets,
-PATH or HTTPS_PROXY say, get your own values back when you switch away.
-
-Tokens from 'vault login' are stored per context and bound to the address
-they were issued for: in the macOS Keychain by default, elsewhere in files
-under $VCTX_STATE_DIR/tokens (default $XDG_STATE_HOME/vctx, that is
-~/.local/state/vctx); VCTX_TOKEN_STORE=file or keychain chooses. The
-Keychain keeps tokens off disk and out of backups, but like a 0600 file it
-does not hide them from other programs running as you. vctx sets
-VAULT_CONFIG_PATH to a generated config that registers vctx itself as the
-Vault token helper.
-
-The config and the state directory must not be writable by other users.
-
-Environment:
-  VCTX_CONFIG         config file
-  VCTX_STATE_DIR      tokens, default context, generated Vault config
-  VCTX_TOKEN_STORE    file or keychain
-  VCTX_CHECK_TIMEOUT  reachability check timeout, 0 skips it before commands
-  VCTX_VAULT_BIN      vault binary to run (default: vault on PATH)
-  VCTX_CONTEXT        set for vault and in a 'vctx env' shell: the context
-                      (with VCTX_CONTEXT_ADDR, VCTX_CONTEXT_NAMESPACE,
-                      VCTX_VARS, VCTX_SAVED_*)
-
-In a terminal that does not answer terminal queries (some ssh or serial
-setups), each command can pause for seconds; TERM=dumb avoids it.
-
-Docs and issues: https://github.com/eugene-panin/vctx
-`
 
 type app struct {
 	home       string
@@ -129,6 +36,7 @@ type app struct {
 	exec                           func(argv0 string, argv, envv []string) error
 	keyring                        token.SecretService // nil means the system keychain
 	version                        string
+	noInput                        bool // --no-input: never ask
 }
 
 // errSilent ends the program with status 1 but no message: the failure is already on screen.
@@ -215,156 +123,50 @@ func (a *app) getenv(key string) string {
 }
 
 func (a *app) run(args []string) error {
-	if len(args) == 1 && token.IsHelperOp(args[0]) {
-		return a.tokenHelper(args[0])
-	}
-	if len(args) == 0 {
-		if a.stdinTTY && a.stdoutTTY {
-			return a.ui()
-		}
-		fmt.Fprint(a.stdout, usage)
-		return nil
-	}
+	root := a.rootCmd(args)
+	root.SetArgs(args)
+	root.SetIn(a.stdin)
+	root.SetOut(a.stdout)
+	root.SetErr(a.stderr)
+	return root.Execute()
+}
 
-	cmd, rest := args[0], args[1:]
-	if cmd == "list" {
-		cmd = "ls"
+// logout is 'vctx logout [<name>]'.
+func (a *app) logout(arg string) error {
+	store, err := a.tokens()
+	if err != nil {
+		return err
 	}
-	if help, ok := commandHelp[cmd]; ok && wantsHelp(rest) {
-		fmt.Fprint(a.stdout, help)
-		return nil
-	}
-	switch cmd {
-	case "help", "-h", "--help":
-		if len(rest) == 1 {
-			if help, ok := commandHelp[rest[0]]; ok {
-				fmt.Fprint(a.stdout, help)
-				return nil
-			}
-		}
-		fmt.Fprint(a.stdout, usage)
-		return nil
-	case "version", "--version":
-		fmt.Fprintln(a.stdout, "vctx", a.version)
-		return nil
-	case "ui":
-		return a.ui()
-	case "ls", "list":
-		switch {
-		case len(rest) == 0:
-			return a.list(false)
-		case len(rest) == 1 && rest[0] == "--json":
-			return a.list(true)
-		}
-		return commandUsage("ls")
-	case "use":
-		if len(rest) > 1 || len(rest) == 1 && strings.HasPrefix(rest[0], "-") {
-			return commandUsage("use")
-		}
-		if len(rest) == 0 {
-			return a.ui()
-		}
-		cfg, err := a.loadConfig()
-		if err != nil {
-			return err
-		}
-		timeout, err := a.checkTimeout()
-		if err != nil {
-			return err
-		}
-		ctx, stop := login.Interruptible()
-		defer stop()
-		if err := a.use(cfg, rest[0]); err != nil {
-			return err
-		}
-		shell.Announce(a.environ, rest[0])
-		a.printUsing(rest[0], cfg)
-		a.loginRunner(timeout).Ensure(ctx, cfg, rest[0])
-		return nil
-	case "current":
-		if len(rest) > 0 {
-			return commandUsage("current")
-		}
+	// In a context shell, forget the token vault would use there, which
+	// may be an address key if VAULT_ADDR was changed by hand.
+	if arg == "" && a.getenv(environ.Context) != "" {
 		name, err := a.contextName("")
 		if err != nil {
 			return err
 		}
-		fmt.Fprintln(a.stdout, name)
-		return nil
-	case "env":
-		return a.env(rest)
-	case "init":
-		return a.initShell(rest)
-	case "check":
-		names := slices.DeleteFunc(slices.Clone(rest), func(arg string) bool { return arg == "--json" })
-		if slices.ContainsFunc(names, func(arg string) bool { return strings.HasPrefix(arg, "-") }) {
-			return commandUsage("check")
+		key := token.Key(a.environ)
+		what := "the token of " + name
+		if key != name {
+			addr, _ := config.AddrFrom(a.getenv)
+			what = "the token for " + config.RedactAddr(config.NormalizeAddr(addr))
 		}
-		return a.check(names, len(names) < len(rest))
-	case "logout":
-		if len(rest) > 1 || len(rest) == 1 && strings.HasPrefix(rest[0], "-") {
-			return commandUsage("logout")
-		}
-		store, err := a.tokens()
-		if err != nil {
-			return err
-		}
-		// In a context shell, forget the token vault would use there, which
-		// may be an address key if VAULT_ADDR was changed by hand.
-		if len(rest) == 0 && a.getenv(environ.Context) != "" {
-			name, err := a.contextName("")
-			if err != nil {
-				return err
-			}
-			key := token.Key(a.environ)
-			what := "the token of " + name
-			if key != name {
-				addr, _ := config.AddrFrom(a.getenv)
-				what = "the token for " + config.RedactAddr(config.NormalizeAddr(addr))
-			}
-			return a.forget(store, key, what)
-		}
-		var arg string
-		if len(rest) == 1 {
-			arg = rest[0]
-		}
-		name, err := a.contextName(arg)
-		if err != nil {
-			return err
-		}
-		cfg, err := a.loadConfig()
-		if err != nil {
-			return err
-		}
-		// A context renamed or removed from the config may still have a token to forget.
-		if _, ok := cfg.Contexts[name]; !ok {
-			if _, stored, err := store.Addr(name); err != nil || !stored {
-				return errors.Join(fmt.Errorf("unknown context %q", name), err)
-			}
-		}
-		return a.forget(store, name, "the token of "+name)
-	case "exec":
-		name, argv := splitExec(rest)
-		if len(argv) == 0 {
-			return commandUsage("exec")
-		}
-		return a.execIn(name, argv)
-	default:
-		cfg, err := a.loadConfig()
-		if err != nil {
-			if s := suggest(cmd, commands); s != "" {
-				return usageError(fmt.Sprintf("unknown command %q, did you mean %q?", cmd, s))
-			}
-			return err
-		}
-		if _, ok := cfg.Contexts[cmd]; !ok {
-			if s := suggest(cmd, append(slices.Sorted(maps.Keys(cfg.Contexts)), commands...)); s != "" {
-				return usageError(fmt.Sprintf("unknown command or context %q, did you mean %q?", cmd, s))
-			}
-			return usageError(fmt.Sprintf("unknown command or context %q, see 'vctx help'", cmd))
-		}
-		return a.execWith(cfg, cmd, append([]string{a.vaultBin()}, rest...))
+		return a.forget(store, key, what)
 	}
+	name, err := a.contextName(arg)
+	if err != nil {
+		return err
+	}
+	cfg, err := a.loadConfig()
+	if err != nil {
+		return err
+	}
+	// A context renamed or removed from the config may still have a token to forget.
+	if _, ok := cfg.Contexts[name]; !ok {
+		if _, stored, err := store.Addr(name); err != nil || !stored {
+			return errors.Join(fmt.Errorf("unknown context %q", name), err)
+		}
+	}
+	return a.forget(store, name, "the token of "+name)
 }
 
 // forget deletes the token under key and says whether there was one to forget.
@@ -382,21 +184,6 @@ func (a *app) forget(store token.Store, key, what string) error {
 	}
 	fmt.Fprintf(a.stderr, "forgot %s\n", what)
 	return nil
-}
-
-// splitExec splits "[name] [--] cmd args..." into the context name and the command.
-func splitExec(args []string) (string, []string) {
-	if len(args) > 0 && args[0] == "--" {
-		return "", args[1:]
-	}
-	if len(args) == 0 {
-		return "", nil
-	}
-	name, argv := args[0], args[1:]
-	if len(argv) > 0 && argv[0] == "--" {
-		argv = argv[1:]
-	}
-	return name, argv
 }
 
 // addressFlag returns a vault flag that points vault at another server than the
@@ -422,12 +209,6 @@ func (a *app) vaultBin() string {
 	return "vault"
 }
 
-// commands are the subcommands run dispatches on, token helper operations
-// included. Context names double as subcommands ("vctx prod ..."), so they
-// must not shadow these.
-var commands = []string{"help", "-h", "--help", "version", "--version", "ui", "ls", "list", "use", "current",
-	"env", "exec", "init", "check", "logout", "get", "store", "erase"}
-
 func (a *app) loadConfig() (*config.Config, error) {
 	cfg, err := config.Load(a.configPath)
 	if errors.Is(err, fs.ErrNotExist) {
@@ -436,6 +217,7 @@ func (a *app) loadConfig() (*config.Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	commands := a.commandNames()
 	for _, name := range slices.Sorted(maps.Keys(cfg.Contexts)) {
 		if slices.Contains(commands, name) {
 			return nil, fmt.Errorf("%s: context name %q is a vctx command", a.configPath, name)
@@ -565,27 +347,8 @@ func (a *app) shellOverride(name string) string {
 	return ""
 }
 
-func (a *app) env(args []string) error {
-	var name string
-	var clear, fromDefault, fish bool
-	for i := 0; i < len(args); i++ {
-		switch arg := args[i]; {
-		case arg == "--clear":
-			clear = true
-		case arg == "--default":
-			fromDefault = true
-		case arg == "--shell" && i+1 < len(args) && (args[i+1] == "fish" || args[i+1] == "posix"):
-			fish = args[i+1] == "fish"
-			i++
-		case !strings.HasPrefix(arg, "-") && name == "":
-			name = arg
-		default:
-			return commandUsage("env")
-		}
-	}
-	if clear && (name != "" || fromDefault) || name != "" && fromDefault {
-		return commandUsage("env")
-	}
+// env is 'vctx env': exports for name, the default context, or undoing a switch.
+func (a *app) env(name string, fromDefault, clear, fish bool) error {
 	write := environ.WritePOSIX
 	if fish {
 		write = environ.WriteFish
