@@ -222,6 +222,9 @@ func (a *app) printUsing(name string, cfg *config) {
 	vars, _ := cfg.vars(name, a.home)
 	addr := redactAddr(vaultAddr(vars))
 	override := a.shellOverride(name)
+	if a.getenv("VCTX_SHELL") != "" {
+		override = "" // the shell integration switches this terminal right after
+	}
 	if !a.stderrTTY {
 		fmt.Fprintf(a.stderr, "using %s (%s)\n", name, addr)
 		if override != "" {
@@ -231,13 +234,16 @@ func (a *app) printUsing(name string, cfg *config) {
 	}
 	p := newPalette(a.stderr)
 	fmt.Fprintf(a.stderr, "%s %s %s\n", p.accent.Render("●"), p.bold.Render(name), p.dim.Render(addr))
+	if a.getenv("VCTX_SHELL") != "" {
+		return // the shell integration switches this terminal right after
+	}
 	if override != "" {
 		fmt.Fprintln(a.stderr, p.warn.Render(fmt.Sprintf("  this shell has %s=%s, it takes precedence here", envContext, override)))
 	}
-	// Shown once: the alias is the missing piece for plain `vault` to follow `vctx use`.
-	marker := filepath.Join(a.stateDir, "hint-alias")
+	// Shown once: the integration is what makes plain `vault` follow `vctx use`.
+	marker := filepath.Join(a.stateDir, "hint-init")
 	if _, err := os.Stat(marker); errors.Is(err, fs.ErrNotExist) {
-		fmt.Fprintln(a.stderr, p.dim.Render("  tip: make plain `vault` follow this choice: alias vault='vctx exec -- vault'"))
+		fmt.Fprintln(a.stderr, p.dim.Render("  tip: run `vctx init` once, and this terminal and plain `vault` follow `vctx use`"))
 		_ = writeFileAtomic(marker, nil, 0o600)
 	}
 }

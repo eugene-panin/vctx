@@ -22,6 +22,8 @@ Usage:
   vctx                             interactive UI: status, switch, login, shell
   vctx <context> [vault args...]   run vault against <context>
   vctx exec [<context>] -- cmd     run any command with <context> variables
+  vctx init                        set up your shell once: then 'vctx use'
+                                   switches the terminal and vault follows
   vctx env [<context>]             print exports: eval "$(vctx env prod)"
   vctx env --clear                 print commands that undo 'vctx env'
   vctx use [<context>]             set the default context (UI without a name)
@@ -225,6 +227,8 @@ func (a *app) run(args []string) error {
 		return nil
 	case "env":
 		return a.env(rest)
+	case "init":
+		return a.initShell(rest)
 	case "check":
 		if slices.ContainsFunc(rest, func(arg string) bool { return strings.HasPrefix(arg, "-") }) {
 			return usageError("usage: vctx check [<context>...]")
@@ -337,17 +341,26 @@ func (a *app) contextName(arg string) (string, error) {
 		name, from = a.getenv(envContext), "$"+envContext
 	}
 	if name == "" {
-		b, err := os.ReadFile(a.currentFile())
-		if errors.Is(err, fs.ErrNotExist) {
-			return "", errors.New("no context selected: pass a name or run 'vctx use <context>'")
-		}
-		if err != nil {
-			return "", err
-		}
-		name, from = strings.TrimSpace(string(b)), a.currentFile()
+		return a.defaultContext()
 	}
 	if !nameRe.MatchString(name) {
 		return "", fmt.Errorf("invalid context name %q in %s", name, from)
+	}
+	return name, nil
+}
+
+// defaultContext is the context saved by `vctx use`, whatever this shell has.
+func (a *app) defaultContext() (string, error) {
+	b, err := os.ReadFile(a.currentFile())
+	if errors.Is(err, fs.ErrNotExist) {
+		return "", errors.New("no context selected: pass a name or run 'vctx use <context>'")
+	}
+	if err != nil {
+		return "", err
+	}
+	name := strings.TrimSpace(string(b))
+	if !nameRe.MatchString(name) {
+		return "", fmt.Errorf("invalid context name %q in %s", name, a.currentFile())
 	}
 	return name, nil
 }
@@ -408,18 +421,41 @@ func (a *app) shellOverride(name string) string {
 }
 
 func (a *app) env(args []string) error {
-	if len(args) == 1 && args[0] == "--clear" {
-		writeShellEnv(a.stdout, a.environ, nil)
+	var name string
+	var clear, fromDefault, fish bool
+	for i := 0; i < len(args); i++ {
+		switch arg := args[i]; {
+		case arg == "--clear":
+			clear = true
+		case arg == "--default":
+			fromDefault = true
+		case arg == "--shell" && i+1 < len(args) && (args[i+1] == "fish" || args[i+1] == "posix"):
+			fish = args[i+1] == "fish"
+			i++
+		case !strings.HasPrefix(arg, "-") && name == "":
+			name = arg
+		default:
+			return usageError("usage: vctx env [<context> | --default | --clear] [--shell posix|fish]")
+		}
+	}
+	if clear && (name != "" || fromDefault) || name != "" && fromDefault {
+		return usageError("usage: vctx env [<context> | --default | --clear] [--shell posix|fish]")
+	}
+	write := writeShellEnv
+	if fish {
+		write = writeFishEnv
+	}
+	if clear {
+		write(a.stdout, a.environ, nil)
 		return nil
 	}
-	if len(args) > 1 || len(args) == 1 && strings.HasPrefix(args[0], "-") {
-		return usageError("usage: vctx env [<context> | --clear]")
+
+	var err error
+	if fromDefault {
+		name, err = a.defaultContext()
+	} else {
+		name, err = a.contextName(name)
 	}
-	var arg string
-	if len(args) == 1 {
-		arg = args[0]
-	}
-	name, err := a.contextName(arg)
 	if err != nil {
 		return err
 	}
@@ -434,7 +470,7 @@ func (a *app) env(args []string) error {
 	if err := a.registerHelper(vars); err != nil {
 		return err
 	}
-	writeShellEnv(a.stdout, a.environ, vars)
+	write(a.stdout, a.environ, vars)
 	return nil
 }
 
