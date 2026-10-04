@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -314,8 +315,13 @@ without the integration ('vctx init'). --default uses the default context,
 			if len(args) == 1 {
 				name = args[0]
 			}
-			if sh != "posix" && sh != "fish" || clear && (name != "" || fromDefault) || name != "" && fromDefault {
-				return usageFor(c)
+			switch {
+			case sh != "posix" && sh != "fish":
+				return usageError(fmt.Sprintf("--shell is posix or fish, not %q (see 'vctx env -h')", sh))
+			case clear && (name != "" || fromDefault):
+				return usageError("--clear does not go with a context or --default (see 'vctx env -h')")
+			case name != "" && fromDefault:
+				return usageError("a context does not go with --default (see 'vctx env -h')")
 			}
 			return a.env(name, fromDefault, clear, sh == "fish")
 		},
@@ -345,7 +351,7 @@ terminal it runs in and plain vault follows. The shell comes from $SHELL unless
 				if sh != "" {
 					return usageFor(c)
 				}
-				return a.shellSetup().Print(args[0], a.stdout)
+				return asShellUsage(a.shellSetup().Print(args[0], a.stdout))
 			}
 			return a.initShell(sh)
 		},
@@ -426,7 +432,9 @@ func (a *app) switchTo(name string) error {
 	}
 	shell.Announce(a.environ, name)
 	a.printUsing(name, cfg)
-	a.loginRunner(timeout).Ensure(ctx, cfg, name)
+	if errors.Is(a.loginRunner(timeout).Ensure(ctx, cfg, name), login.ErrCancelled) {
+		return errInterrupted
+	}
 	return nil
 }
 

@@ -628,3 +628,28 @@ func TestFlagsSurviveConfigLoad(t *testing.T) {
 		t.Errorf("noColor %v, noInput %v", a.noColor, a.noInput)
 	}
 }
+
+func TestEnvMisuseSaysWhy(t *testing.T) {
+	for args, want := range map[string]string{
+		"--shell zsh":       "--shell is posix or fish",
+		"--clear --default": "--clear does not go with",
+		"dev --default":     "a context does not go with --default",
+	} {
+		a, _, _ := newTestApp(t)
+		err := a.run(append([]string{"env"}, strings.Fields(args)...))
+		var uerr usageError
+		if !errors.As(err, &uerr) || !strings.Contains(err.Error(), want) {
+			t.Errorf("env %s: %v", args, err)
+		}
+	}
+}
+
+func TestInitUnsupportedShellIsUsage(t *testing.T) {
+	for _, args := range [][]string{{"init", "tcsh"}, {"init", "--shell", "tcsh"}} {
+		a, _, _ := newTestApp(t)
+		var uerr usageError
+		if err := a.run(args); !errors.As(err, &uerr) || !strings.Contains(err.Error(), "zsh, bash and fish") {
+			t.Errorf("%q: %v", args, err)
+		}
+	}
+}

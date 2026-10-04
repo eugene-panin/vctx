@@ -20,6 +20,18 @@ func (a *app) loginRunner(timeout time.Duration) *login.Runner {
 		In:          a.stdin,
 		Out:         a.stderr,
 		Interactive: a.stdinTTY && a.stderrTTY && !a.noInput,
+		NoAsk:       a.noAsk(),
 		NoColor:     a.noColor,
 	}
+}
+
+// noAsk says why vctx asks nothing, if it does not.
+func (a *app) noAsk() string {
+	if a.noInput {
+		return "--no-input"
+	}
+	if !a.stdinTTY || !a.stderrTTY {
+		return "no terminal"
+	}
+	return ""
 }

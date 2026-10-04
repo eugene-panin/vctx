@@ -117,8 +117,11 @@ func (s Setup) RCFile(shell string) (string, error) {
 	return "", unsupported(shell)
 }
 
+// ErrUnsupported is a shell vctx has no integration for.
+var ErrUnsupported = errors.New("unsupported shell")
+
 func unsupported(shell string) error {
-	return fmt.Errorf("unsupported shell %q: vctx supports zsh, bash and fish", shell)
+	return fmt.Errorf("%w %q: vctx supports zsh, bash and fish", ErrUnsupported, shell)
 }
 
 func fileExists(path string) bool {

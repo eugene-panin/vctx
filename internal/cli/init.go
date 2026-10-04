@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"errors"
 	"path/filepath"
 
 	"github.com/eugene-panin/vctx/internal/shell"
@@ -26,5 +27,13 @@ func (a *app) initShell(sh string) error {
 	if sh == "" {
 		return usageError("cannot tell your shell: $SHELL is not set; run 'vctx init --shell zsh|bash|fish'")
 	}
-	return a.shellSetup().Install(sh, a.stdout)
+	return asShellUsage(a.shellSetup().Install(sh, a.stdout))
+}
+
+// asShellUsage makes a shell vctx does not support a malformed command line.
+func asShellUsage(err error) error {
+	if errors.Is(err, shell.ErrUnsupported) {
+		return usageError(err.Error() + " (see 'vctx init -h')")
+	}
+	return err
 }

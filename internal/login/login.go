@@ -42,7 +42,10 @@ type Runner struct {
 	In          io.Reader
 	Out         io.Writer // where vctx reports and asks, stderr for the CLI
 	Interactive bool      // In and Out are a terminal: there is someone to ask
-	NoColor     bool      // --no-color
+	// NoAsk says why nothing is asked when Interactive is false, such as
+	// "no terminal" or "--no-input".
+	NoAsk   string
+	NoColor bool // --no-color
 }
 
 // colorEnv is the environment styling decides by.
@@ -53,8 +56,8 @@ func (r *Runner) colorEnv() []string {
 	return r.Environ
 }
 
-// errCancelled is a login given up with Ctrl-C.
-var errCancelled = errors.New("cancelled")
+// ErrCancelled is a login given up with Ctrl-C.
+var ErrCancelled = errors.New("cancelled")
 
 // Interruptible catches Ctrl-C until stop is called. The terminal sends
 // SIGINT to the whole foreground group: vault, when it runs, handles it
@@ -90,7 +93,7 @@ func (a *answers) ask(out io.Writer, prompt, def string) (string, error) {
 	line, err := a.r.ReadString('\n')
 	if errors.Is(err, cancelreader.ErrCanceled) {
 		fmt.Fprintln(out)
-		return "", errCancelled
+		return "", ErrCancelled
 	}
 	if err != nil && (line == "" || !errors.Is(err, io.EOF)) {
 		return "", fmt.Errorf("no answer: %w", err)
@@ -126,7 +129,7 @@ func (r *Runner) tokenWorks(ctx context.Context, env []string) (bool, error) {
 	case err == nil:
 		return true, nil
 	case ctx.Err() != nil:
-		return false, errCancelled
+		return false, ErrCancelled
 	case strings.Contains(text, "invalid token"):
 		return false, nil
 	case strings.Contains(text, "Code: 403"):
@@ -149,7 +152,7 @@ func (r *Runner) vaultHasToken(ctx context.Context, env []string) (bool, error) 
 	out, err := cmd.Output()
 	if err != nil {
 		if ctx.Err() != nil {
-			return false, errCancelled
+			return false, ErrCancelled
 		}
 		return false, fmt.Errorf("ask vault for its token: %w", err)
 	}
@@ -177,17 +180,54 @@ func vaultError(out string) string {
 
 // Ensure makes sure context name has a working token after `vctx use`:
 // with none, or one vault refuses, it logs in. It only reports problems: the
-// switch has happened either way. ctx ends with Ctrl-C.
-func (r *Runner) Ensure(ctx context.Context, cfg *config.Config, name string) {
+// switch has happened either way. ctx ends with Ctrl-C, and then Ensure
+// returns ErrCancelled. With no one to ask it only says what is missing.
+func (r *Runner) Ensure(ctx context.Context, cfg *config.Config, name string) error {
 	if !r.Interactive {
-		return // nothing to ask in a script
+		r.noLogin(cfg, name)
+		return nil
 	}
+	r.ensure(ctx, cfg, name)
+	if ctx.Err() != nil {
+		return ErrCancelled
+	}
+	return nil
+}
+
+// noLogin says so when context name has no token vctx could use, and there is
+// no one to log in: otherwise vault fails later with a bare 403.
+func (r *Runner) noLogin(cfg *config.Config, name string) {
+	vars, err := cfg.Vars(name, r.Home)
+	if err != nil || vars["VAULT_AGENT_ADDR"] != "" || vars["VAULT_TOKEN"] != "" || vars["VAULT_CONFIG_PATH"] != "" {
+		return // vctx's store does not decide these
+	}
+	store, err := r.Tokens()
+	if err != nil {
+		return
+	}
+	state, err := token.StateOf(store, cfg, r.Home, name)
+	if err != nil || state == token.OK {
+		return
+	}
+	what := "has no token yet"
+	if state == token.Stale {
+		what = "has a token for another address"
+	}
+	why := r.NoAsk
+	if why == "" {
+		why = "nothing can be asked"
+	}
+	p := style.New(r.Out, r.colorEnv())
+	fmt.Fprintln(r.Out, p.Warn.Render(fmt.Sprintf("  %s %s; not logging in (%s): 'vctx use %s' in a terminal logs in", name, what, why, name)))
+}
+
+func (r *Runner) ensure(ctx context.Context, cfg *config.Config, name string) {
 	p := style.New(r.Out, r.colorEnv())
 	warn := func(format string, args ...any) {
 		fmt.Fprintln(r.Out, p.Warn.Render("  "+fmt.Sprintf(format, args...)))
 	}
 	report := func(err error) {
-		if errors.Is(err, errCancelled) {
+		if errors.Is(err, ErrCancelled) {
 			warn("login cancelled")
 			return
 		}
@@ -200,7 +240,7 @@ func (r *Runner) Ensure(ctx context.Context, cfg *config.Config, name string) {
 	}
 	if ok, why := r.loginPossible(ctx, env); !ok {
 		if ctx.Err() != nil {
-			report(errCancelled)
+			report(ErrCancelled)
 			return
 		}
 		warn("not logging in: %s", why)
@@ -271,7 +311,7 @@ func (r *Runner) Ensure(ctx context.Context, cfg *config.Config, name string) {
 		}
 	}
 	if err := r.login(ctx, cfg, name, reason, env, r.In, r.Out); err != nil {
-		if errors.Is(err, errCancelled) {
+		if errors.Is(err, ErrCancelled) {
 			report(err)
 			return
 		}
@@ -352,7 +392,7 @@ func (r *Runner) login(ctx context.Context, cfg *config.Config, name, reason str
 			fmt.Fprintln(out, p.OK.Render("  logged in"))
 			return nil
 		case ctx.Err() != nil:
-			return errCancelled
+			return ErrCancelled
 		case fromConfig:
 			return err
 		}
@@ -510,7 +550,7 @@ func (l *Cmd) Run() error {
 	if err == nil {
 		err = l.r.login(ctx, l.cfg, l.name, "login requested", env, l.in, l.out)
 	}
-	if err != nil && !errors.Is(err, errCancelled) {
+	if err != nil && !errors.Is(err, ErrCancelled) {
 		fmt.Fprintf(l.out, "  %s login failed: %v\n", l.name, err)
 		ans := newAnswers(ctx, l.in)
 		defer ans.close()

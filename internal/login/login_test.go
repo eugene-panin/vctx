@@ -3,6 +3,7 @@ package login
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
@@ -257,8 +258,9 @@ func TestCancelAtPrompt(t *testing.T) {
 	cfg := activeContext(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
+	var ensured error
 	go func() {
-		r.Ensure(ctx, cfg, "x")
+		ensured = r.Ensure(ctx, cfg, "x")
 		close(done)
 	}()
 	for !strings.Contains(out.String(), "method [1]") {
@@ -273,6 +275,9 @@ func TestCancelAtPrompt(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("the question did not give up on Ctrl-C")
+	}
+	if !errors.Is(ensured, ErrCancelled) {
+		t.Errorf("Ensure = %v, want ErrCancelled", ensured)
 	}
 	if !strings.Contains(out.String(), "login cancelled") {
 		t.Errorf("output %q", out.String())
@@ -347,4 +352,39 @@ func (s *syncBuffer) String() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.b.String()
+}
+
+// With no one to ask, Ensure says the login it skips, instead of leaving vault
+// to fail with a bare 403 later.
+func TestNoLoginWithoutTerminal(t *testing.T) {
+	for _, tc := range []struct {
+		name, yaml string
+		stored     bool
+		want       string
+	}{
+		{"no token", "contexts:\n  x:\n    VAULT_ADDR: http://v\n", false, "x has no token yet; not logging in (no terminal)"},
+		{"token stored", "contexts:\n  x:\n    VAULT_ADDR: http://v\n", true, ""},
+		{"token in the context", "contexts:\n  x:\n    VAULT_ADDR: http://v\n    VAULT_TOKEN: hvs.x\n", false, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bin, log := fakeVault(t, "ok")
+			r, out := newRunner(t, bin)
+			r.Interactive, r.NoAsk = false, "no terminal"
+			if tc.stored {
+				s, _ := r.Tokens()
+				if err := s.Set("x", "tok", "http://v"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := r.Ensure(context.Background(), loadConfig(t, tc.yaml), "x"); err != nil {
+				t.Fatal(err)
+			}
+			if got := out.String(); tc.want == "" && got != "" || !strings.Contains(got, tc.want) {
+				t.Errorf("output %q, want %q", got, tc.want)
+			}
+			if c := calls(t, log); c != "" {
+				t.Errorf("vault ran: %s", c)
+			}
+		})
+	}
 }

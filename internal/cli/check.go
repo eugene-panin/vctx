@@ -88,7 +88,11 @@ func (a *app) check(args []string, asJSON bool) error {
 			return err
 		}
 	}
-	a.spin(fmt.Sprintf("checking %d instances", len(names)), func() { probe.All(ps, timeout) })
+	what := fmt.Sprintf("%d instances", len(names))
+	if len(names) == 1 {
+		what = "1 instance"
+	}
+	a.spin("checking "+what, func() { probe.All(ps, timeout) })
 	statuses := make([]probe.Status, len(ps))
 	for i := range ps {
 		statuses[i] = ps[i].Status

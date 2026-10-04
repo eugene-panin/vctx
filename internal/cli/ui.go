@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"errors"
 	"maps"
 	"slices"
 
@@ -44,7 +45,9 @@ func (a *app) ui() error {
 	defer stop()
 	shell.Announce(a.environ, chosen)
 	a.printUsing(chosen, cfg)
-	logins.Ensure(ctx, cfg, chosen)
+	if errors.Is(logins.Ensure(ctx, cfg, chosen), login.ErrCancelled) {
+		return errInterrupted
+	}
 	return nil
 }
 

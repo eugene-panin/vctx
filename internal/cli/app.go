@@ -57,6 +57,10 @@ func (a *app) palette(w io.Writer) style.Palette {
 // errSilent ends the program with status 1 but no message: the failure is already on screen.
 var errSilent = errors.New("failed")
 
+// errInterrupted ends the program with status 130, stopped with Ctrl-C, and
+// no message: what was given up is already on screen.
+var errInterrupted = errors.New("interrupted")
+
 // usageError is a malformed command line; it exits with status 2.
 type usageError string
 
@@ -77,6 +81,8 @@ func Main(version string) int {
 		return 0
 	case errors.Is(err, errSilent):
 		return 1
+	case errors.Is(err, errInterrupted):
+		return 130
 	case errors.As(err, &uerr):
 		fmt.Fprintln(os.Stderr, "vctx:", err)
 		return 2
