@@ -1,7 +1,10 @@
-package main
+// Package tui is vctx's full-screen interface: contexts with live status,
+// switching, logging in, and a shell in a context.
+package tui
 
 import (
 	"fmt"
+	"io"
 	"maps"
 	"os/exec"
 	"slices"
@@ -13,6 +16,12 @@ import (
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/eugene-panin/vctx/internal/config"
+	"github.com/eugene-panin/vctx/internal/environ"
+	"github.com/eugene-panin/vctx/internal/probe"
+	"github.com/eugene-panin/vctx/internal/status"
+	"github.com/eugene-panin/vctx/internal/style"
+	"github.com/eugene-panin/vctx/internal/token"
 )
 
 type keyMap struct {
@@ -37,7 +46,8 @@ var keys = keyMap{
 }
 
 type row struct {
-	prepared
+	status.Context
+	login   []string // the login method, from the config or remembered
 	probing bool
 	gen     int // bumped per probe so a late answer from an older one is ignored
 }
@@ -45,7 +55,7 @@ type row struct {
 type probeMsg struct {
 	i   int
 	gen int
-	res probeResult
+	res probe.Result
 }
 
 type execDoneMsg struct {
@@ -56,7 +66,7 @@ type execDoneMsg struct {
 
 type tokensMsg struct {
 	gen    int
-	tokens map[string]tokenState
+	tokens map[string]token.State
 	err    error
 }
 
@@ -66,8 +76,7 @@ type forgetMsg struct {
 }
 
 type model struct {
-	a       *app
-	cfg     *config
+	b       Backend
 	rows    []row
 	cursor  int
 	offset  int
@@ -77,46 +86,37 @@ type model struct {
 	height  int
 	spin    spinner.Model
 	help    help.Model
-	p       palette
+	p       style.Palette
 	flash   string
 	flashOK bool
 	chosen  string
 	// Loaded in the background: with the keychain every lookup runs a process.
-	tokens       map[string]tokenState
+	tokens       map[string]token.State
 	tokensLoaded bool
 	tokenGen     int // bumped per load, and on forget, so a late answer is ignored
 }
 
-func newModel(a *app, cfg *config) (*model, error) {
-	timeout, err := a.checkTimeout()
-	if err != nil {
-		return nil, err
-	}
+func newModel(b Backend, contexts []status.Context, timeout time.Duration, out io.Writer) *model {
 	if timeout == 0 {
-		timeout = defaultCheckTimeout
+		timeout = probe.DefaultTimeout
 	}
 	m := &model{
-		a:       a,
-		cfg:     cfg,
+		b:       b,
 		timeout: timeout,
 		spin:    spinner.New(spinner.WithSpinner(spinner.MiniDot)),
 		help:    help.New(),
-		p:       newPalette(a.stdout),
-		tokens:  map[string]tokenState{},
+		p:       style.New(out),
+		tokens:  map[string]token.State{},
+		current: b.Current(),
 	}
-	m.spin.Style = m.p.accent
-	m.current, _ = a.contextName("")
-	for _, name := range slices.Sorted(maps.Keys(cfg.Contexts)) {
-		p, err := a.prepare(cfg, name)
-		if err != nil {
-			return nil, err
-		}
-		if name == m.current {
+	m.spin.Style = m.p.Accent
+	for _, c := range contexts {
+		if c.Status.Name == m.current {
 			m.cursor = len(m.rows)
 		}
-		m.rows = append(m.rows, row{prepared: p})
+		m.rows = append(m.rows, row{Context: c, login: b.LoginMethod(c.Status.Name)})
 	}
-	return m, nil
+	return m
 }
 
 func (m *model) Init() tea.Cmd {
@@ -134,38 +134,34 @@ func (m *model) refresh() tea.Cmd {
 
 // probe checks row i again; a row whose address does not resolve has nothing to check.
 func (m *model) probe(i int) tea.Cmd {
-	if m.rows[i].badAddr {
+	if m.rows[i].BadAddr {
 		return nil
 	}
 	m.rows[i].probing = true
 	m.rows[i].gen++
-	p, gen, timeout := m.rows[i].prepared, m.rows[i].gen, m.timeout
+	p, gen, timeout := m.rows[i].Context, m.rows[i].gen, m.timeout
 	return func() tea.Msg {
-		return probeMsg{i: i, gen: gen, res: p.probeHealth(timeout)}
+		return probeMsg{i: i, gen: gen, res: p.Probe(timeout)}
 	}
 }
 
 func (m *model) loadTokens() tea.Cmd {
 	names := make([]string, len(m.rows))
 	for i, r := range m.rows {
-		names[i] = r.status.name
+		names[i] = r.Status.Name
 	}
 	m.tokenGen++
-	a, cfg, gen := m.a, m.cfg, m.tokenGen
+	b, gen := m.b, m.tokenGen
 	return func() tea.Msg {
-		tokens, err := a.tokenStatus(cfg, names)
+		tokens, err := b.TokenStatus(names)
 		return tokensMsg{gen: gen, tokens: tokens, err: err}
 	}
 }
 
 func (m *model) forget(name string) tea.Cmd {
-	a := m.a
+	b := m.b
 	return func() tea.Msg {
-		store, err := a.tokens()
-		if err == nil {
-			err = store.del(name)
-		}
-		return forgetMsg{name: name, err: err}
+		return forgetMsg{name: name, err: b.Forget(name)}
 	}
 }
 
@@ -198,7 +194,7 @@ func (m *model) update(msg tea.Msg) tea.Cmd {
 	case probeMsg:
 		if r := &m.rows[msg.i]; msg.gen == r.gen {
 			r.probing = false
-			r.status.probeResult = msg.res
+			r.Status.Result = msg.res
 		}
 	case tokensMsg:
 		if msg.gen != m.tokenGen {
@@ -216,8 +212,8 @@ func (m *model) update(msg tea.Msg) tea.Cmd {
 		}
 		return m.loadTokens()
 	case execDoneMsg:
-		m.current, _ = m.a.contextName("") // `vctx use` may have run in the shell
-		m.rows[msg.i].login = m.a.loginFor(m.cfg, m.rows[msg.i].status.name)
+		m.current = m.b.Current() // `vctx use` may have run in the shell
+		m.rows[msg.i].login = m.b.LoginMethod(m.rows[msg.i].Status.Name)
 		if msg.err != nil {
 			m.setFlash(fmt.Sprintf("%s: %v", msg.what, msg.err), false)
 		} else {
@@ -241,33 +237,33 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 	case key.Matches(msg, keys.Down):
 		m.cursor = min(m.cursor+1, len(m.rows)-1)
 	case key.Matches(msg, keys.Use):
-		if err := m.a.use(m.cfg, r.status.name); err != nil {
+		if err := m.b.Use(r.Status.Name); err != nil {
 			m.setFlash(err.Error(), false)
 			return nil
 		}
-		m.chosen = r.status.name
+		m.chosen = r.Status.Name
 		return tea.Quit
 	case key.Matches(msg, keys.Refresh):
 		m.flash = ""
 		return m.refresh()
 	case key.Matches(msg, keys.Login):
-		i, name := m.cursor, r.status.name
-		return tea.Exec(&loginExec{a: m.a, cfg: m.cfg, name: name}, func(err error) tea.Msg {
+		i, name := m.cursor, r.Status.Name
+		return tea.Exec(m.b.Login(name), func(err error) tea.Msg {
 			return execDoneMsg{i: i, what: name + " login", err: err}
 		})
 	case key.Matches(msg, keys.Shell):
-		sh := m.a.getenv("SHELL")
+		sh := m.b.Getenv("SHELL")
 		if sh == "" {
 			sh = "/bin/sh"
 		}
 		return m.run(m.cursor, "shell", sh)
 	case key.Matches(msg, keys.Logout):
-		if m.tokensLoaded && m.tokens[r.status.name] == tokenNone {
-			m.setFlash(r.status.name+": no stored token", false)
+		if m.tokensLoaded && m.tokens[r.Status.Name] == token.None {
+			m.setFlash(r.Status.Name+": no stored token", false)
 			return nil
 		}
 		m.tokenGen++ // a load already under way would bring the token back
-		return m.forget(r.status.name)
+		return m.forget(r.Status.Name)
 	}
 	return nil
 }
@@ -275,20 +271,19 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 // run suspends the UI and runs a command in the terminal with the context's
 // environment, vctx registered as the token helper.
 func (m *model) run(i int, what, name string, args ...string) tea.Cmd {
-	vars := maps.Clone(m.rows[i].vars)
-	if err := m.a.registerHelper(vars); err != nil {
+	env, err := m.b.CommandEnv(m.rows[i].Vars)
+	if err != nil {
 		m.setFlash(err.Error(), false)
 		return nil
 	}
-	env := applyEnv(m.a.environ, vars)
-	bin, err := lookPath(name, env)
+	bin, err := environ.LookPath(name, env)
 	if err != nil {
 		m.setFlash(err.Error(), false)
 		return nil
 	}
 	cmd := exec.Command(bin, args...)
 	cmd.Env = env
-	label := m.rows[i].status.name + " " + what
+	label := m.rows[i].Status.Name + " " + what
 	return tea.ExecProcess(cmd, func(err error) tea.Msg {
 		return execDoneMsg{i: i, what: label, err: err}
 	})
@@ -355,12 +350,12 @@ func (m *model) View() string {
 
 func (m *model) headerView() string {
 	badge := lipgloss.NewStyle().Reverse(true).Bold(true).Foreground(lipgloss.Color("5")).Render(" vctx ")
-	current := m.p.dim.Render("no default context")
+	current := m.p.Dim.Render("no default context")
 	if m.current != "" {
-		current = m.p.dim.Render("default ") + m.p.bold.Render(m.current)
+		current = m.p.Dim.Render("default ") + m.p.Bold.Render(m.current)
 	}
-	if shell := m.a.getenv(envContext); shell != "" {
-		current = m.p.dim.Render("this shell ") + m.p.warn.Render(shell) + m.p.dim.Render(" ($"+envContext+")")
+	if shell := m.b.Getenv(environ.Context); shell != "" {
+		current = m.p.Dim.Render("this shell ") + m.p.Warn.Render(shell) + m.p.Dim.Render(" ($"+environ.Context+")")
 	}
 	ok, done := 0, 0
 	for _, r := range m.rows {
@@ -368,13 +363,13 @@ func (m *model) headerView() string {
 			continue
 		}
 		done++
-		if _, lvl := r.status.shortSummary(); lvl == levelOK {
+		if _, lvl := r.Status.Short(); lvl == status.OK {
 			ok++
 		}
 	}
-	summary := m.spin.View() + m.p.dim.Render(" checking")
+	summary := m.spin.View() + m.p.Dim.Render(" checking")
 	if done == len(m.rows) {
-		summary = m.p.dim.Render(fmt.Sprintf("%d/%d reachable", ok, len(m.rows)))
+		summary = m.p.Dim.Render(fmt.Sprintf("%d/%d reachable", ok, len(m.rows)))
 	}
 	left := badge + "  " + current
 	gap := m.width - lipgloss.Width(left) - lipgloss.Width(summary)
@@ -385,9 +380,9 @@ func (m *model) headerView() string {
 }
 
 func (m *model) tableView(width, height int) string {
-	statuses := make([]contextStatus, len(m.rows))
+	statuses := make([]status.Status, len(m.rows))
 	for i, r := range m.rows {
-		statuses[i] = r.status
+		statuses[i] = r.Status
 	}
 	cols, levels := statusColumns(statuses, m.current, m.tokens)
 	for i, r := range m.rows {
@@ -409,12 +404,12 @@ func (m *model) tableView(width, height int) string {
 		}
 		return truncate(gut+strings.Join(parts, "  "), width)
 	}
-	lines := []string{line("  ", func(c int) string { return cols[c].header }, func(int) lipgloss.Style { return m.p.dim })}
+	lines := []string{line("  ", func(c int) string { return cols[c].header }, func(int) lipgloss.Style { return m.p.Dim })}
 	for i := m.offset; i < min(m.offset+visible, len(m.rows)); i++ {
 		selected := i == m.cursor
 		gut := "  "
 		if selected {
-			gut = m.p.accent.Render("▌") + " "
+			gut = m.p.Accent.Render("▌") + " "
 		}
 		lines = append(lines, line(gut, func(c int) string {
 			if c == colStatus && m.rows[i].probing {
@@ -422,7 +417,7 @@ func (m *model) tableView(width, height int) string {
 			}
 			return cols[c].cells[i]
 		}, func(c int) lipgloss.Style {
-			return m.p.column(c, levels[i], m.tokens[m.rows[i].status.name], selected, m.rows[i].probing)
+			return columnStyle(m.p, c, levels[i], m.tokens[m.rows[i].Status.Name], selected, m.rows[i].probing)
 		}))
 	}
 	return strings.Join(lines, "\n")
@@ -438,7 +433,7 @@ func displayValue(key, value string) string {
 		}
 	}
 	if strings.Contains(value, "://") {
-		return redactAddr(value)
+		return config.RedactAddr(value)
 	}
 	return value
 }
@@ -453,43 +448,43 @@ func (m *model) detailView(width, height int) string {
 		Width(width - 2)
 	inner := width - 4
 
-	label := func(s string) string { return m.p.dim.Render(fmt.Sprintf("%-8s", s)) }
+	label := func(s string) string { return m.p.Dim.Render(fmt.Sprintf("%-8s", s)) }
 	wrap := func(s string, indent int) string {
 		return lipgloss.NewStyle().Width(max(inner-indent, 10)).Render(s)
 	}
 
-	addr, addrKey := addrFrom(func(k string) string { return r.vars[k] })
+	addr, addrKey := config.AddrFrom(func(k string) string { return r.Vars[k] })
 	var b strings.Builder
-	b.WriteString(m.p.accent.Render(r.status.name) + "\n")
-	b.WriteString(m.p.dim.Render(truncate(redactAddr(addr), inner)) + "\n\n")
+	b.WriteString(m.p.Accent.Render(r.Status.Name) + "\n")
+	b.WriteString(m.p.Dim.Render(truncate(config.RedactAddr(addr), inner)) + "\n\n")
 
-	switch text, lvl := r.status.shortSummary(); {
+	switch text, lvl := r.Status.Short(); {
 	case r.probing:
-		b.WriteString(label("status") + m.spin.View() + m.p.dim.Render(" checking") + "\n")
-	case r.status.err != nil:
-		_, long := classify(r.status.err)
-		b.WriteString(label("status") + m.p.level(lvl).Render(text) + "\n")
-		b.WriteString(indentLines(m.p.dim.Render(wrap(long, 8)), 8) + "\n")
+		b.WriteString(label("status") + m.spin.View() + m.p.Dim.Render(" checking") + "\n")
+	case r.Status.Err != nil:
+		_, long := probe.Classify(r.Status.Err)
+		b.WriteString(label("status") + levelStyle(m.p, lvl).Render(text) + "\n")
+		b.WriteString(indentLines(m.p.Dim.Render(wrap(long, 8)), 8) + "\n")
 	default:
-		b.WriteString(label("status") + m.p.level(lvl).Render(text) + m.p.dim.Render("  "+r.status.latencyText()) + "\n")
+		b.WriteString(label("status") + levelStyle(m.p, lvl).Render(text) + m.p.Dim.Render("  "+r.Status.LatencyText()) + "\n")
 	}
 
 	if args := r.login; args != nil {
-		b.WriteString(label("login") + m.p.dim.Render(truncate(strings.Join(args, " "), inner-8)) + "\n")
+		b.WriteString(label("login") + m.p.Dim.Render(truncate(strings.Join(args, " "), inner-8)) + "\n")
 	}
-	switch m.tokens[r.status.name] {
-	case tokenOK:
-		b.WriteString(label("token") + m.p.ok.Render("✓ stored") + "\n")
-	case tokenStale:
-		b.WriteString(label("token") + m.p.warn.Render("for another address, press l to log in") + "\n")
+	switch m.tokens[r.Status.Name] {
+	case token.OK:
+		b.WriteString(label("token") + m.p.OK.Render("✓ stored") + "\n")
+	case token.Stale:
+		b.WriteString(label("token") + m.p.Warn.Render("for another address, press l to log in") + "\n")
 	default:
-		b.WriteString(label("token") + m.p.dim.Render("none, press l to log in") + "\n")
+		b.WriteString(label("token") + m.p.Dim.Render("none, press l to log in") + "\n")
 	}
 
 	var extra []string
-	for _, k := range slices.Sorted(maps.Keys(r.vars)) {
+	for _, k := range slices.Sorted(maps.Keys(r.Vars)) {
 		if k != addrKey && !strings.HasPrefix(k, "VCTX_") {
-			v, rest, multiline := strings.Cut(displayValue(k, r.vars[k]), "\n")
+			v, rest, multiline := strings.Cut(displayValue(k, r.Vars[k]), "\n")
 			if multiline && rest != "" {
 				v += "…"
 			}
@@ -513,9 +508,9 @@ func (m *model) footerView() string {
 	if m.flash == "" {
 		return h
 	}
-	style := m.p.fail
+	style := m.p.Fail
 	if m.flashOK {
-		style = m.p.ok
+		style = m.p.OK
 	}
 	return truncate(style.Render(m.flash), m.width) + "\n" + h
 }
@@ -532,28 +527,30 @@ func indentLines(s string, n int) string {
 	return pad + strings.ReplaceAll(s, "\n", "\n"+pad)
 }
 
-// ui runs the full-screen interface; picking a context with enter makes it the default.
-func (a *app) ui() error {
-	if !a.stdinTTY || !a.stdoutTTY {
-		return usageError("the interactive UI needs a terminal; use 'vctx use <context>' to set the default")
+// Backend is what the UI needs from the rest of vctx.
+type Backend interface {
+	// Current is the active context: the shell's, else the default.
+	Current() string
+	// Use makes name the default context.
+	Use(name string) error
+	// LoginMethod is the `vault login` arguments name logs in with, nil if unknown.
+	LoginMethod(name string) []string
+	TokenStatus(names []string) (map[string]token.State, error)
+	Forget(name string) error
+	// CommandEnv is the environment for a command run in a context with vars,
+	// vctx being vault's token helper.
+	CommandEnv(vars map[string]string) ([]string, error)
+	// Login logs in to name with the terminal handed over.
+	Login(name string) tea.ExecCommand
+	Getenv(key string) string
+}
+
+// Run shows the interface until the user quits or picks a context with
+// enter, which it returns after b.Use has made it the default.
+func Run(b Backend, contexts []status.Context, timeout time.Duration, in io.Reader, out io.Writer) (chosen string, err error) {
+	m := newModel(b, contexts, timeout, out)
+	if _, err := tea.NewProgram(m, tea.WithAltScreen(), tea.WithInput(in), tea.WithOutput(out)).Run(); err != nil {
+		return "", err
 	}
-	cfg, err := a.loadConfig()
-	if err != nil {
-		return err
-	}
-	m, err := newModel(a, cfg)
-	if err != nil {
-		return err
-	}
-	if _, err := tea.NewProgram(m, tea.WithAltScreen(), tea.WithInput(a.stdin), tea.WithOutput(a.stdout)).Run(); err != nil {
-		return err
-	}
-	if m.chosen != "" {
-		ctx, stop := interruptible()
-		defer stop()
-		a.announceChoice(m.chosen)
-		a.printUsing(m.chosen, cfg)
-		a.ensureLogin(ctx, cfg, m.chosen)
-	}
-	return nil
+	return m.chosen, nil
 }

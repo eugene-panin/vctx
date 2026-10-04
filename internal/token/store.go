@@ -1,4 +1,6 @@
-package main
+// Package token stores Vault tokens per context, bound to the address they
+// were issued for, and speaks Vault's token helper protocol.
+package token
 
 import (
 	"errors"
@@ -10,20 +12,22 @@ import (
 	"runtime"
 	"strings"
 
+	"github.com/eugene-panin/vctx/internal/atomicfile"
+	"github.com/eugene-panin/vctx/internal/config"
 	"github.com/zalando/go-keyring"
 )
 
 const keyringService = "vctx"
 
-// tokenStore keeps one token per key, with the address it was issued for;
+// Store keeps one token per key, with the address it was issued for;
 // keys are context names or "_addr/<hash>".
-type tokenStore interface {
+type Store interface {
 	// get returns the token stored for key and its address; ok is false when there is none.
-	get(key string) (token, addr string, ok bool, err error)
+	Get(key string) (token, addr string, ok bool, err error)
 	// addr is get without the token, where the store can avoid reading the secret.
-	addr(key string) (addr string, ok bool, err error)
-	set(key, token, addr string) error
-	del(key string) error
+	Addr(key string) (addr string, ok bool, err error)
+	Set(key, token, addr string) error
+	Del(key string) error
 }
 
 // encodeToken is the stored form: address and token, one per line.
@@ -43,7 +47,7 @@ type fileStore struct{ dir string }
 
 func (s fileStore) path(key string) string { return filepath.Join(s.dir, filepath.FromSlash(key)) }
 
-func (s fileStore) get(key string) (string, string, bool, error) {
+func (s fileStore) Get(key string) (string, string, bool, error) {
 	b, err := os.ReadFile(s.path(key))
 	if errors.Is(err, fs.ErrNotExist) {
 		return "", "", false, nil
@@ -55,24 +59,24 @@ func (s fileStore) get(key string) (string, string, bool, error) {
 	return token, addr, true, nil
 }
 
-func (s fileStore) addr(key string) (string, bool, error) {
-	_, addr, ok, err := s.get(key)
+func (s fileStore) Addr(key string) (string, bool, error) {
+	_, addr, ok, err := s.Get(key)
 	return addr, ok, err
 }
 
-func (s fileStore) set(key, token, addr string) error {
-	return writeFileAtomic(s.path(key), []byte(encodeToken(token, addr)), 0o600)
+func (s fileStore) Set(key, token, addr string) error {
+	return atomicfile.Write(s.path(key), []byte(encodeToken(token, addr)), 0o600)
 }
 
-func (s fileStore) del(key string) error {
+func (s fileStore) Del(key string) error {
 	if err := os.Remove(s.path(key)); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}
 	return nil
 }
 
-// secretService is the part of the OS keychain vctx uses; tests replace it.
-type secretService interface {
+// SecretService is the part of the OS keychain vctx uses; tests replace it.
+type SecretService interface {
 	Get(service, user string) (string, error)
 	Has(service, user string) (bool, error)
 	Set(service, user, password string) error
@@ -118,7 +122,7 @@ func keychainError(err error) error {
 // written by an earlier version is still read; the next login moves it here,
 // as set removes it. Reads never write.
 type keychainStore struct {
-	kr      secretService
+	kr      SecretService
 	addrDir string
 	legacy  fileStore
 	// oldAddrDir held address records in the version before addrDir; they
@@ -137,7 +141,7 @@ func (s keychainStore) addrPath(key string) string {
 	return filepath.Join(s.addrDir, filepath.FromSlash(key))
 }
 
-func (s keychainStore) get(key string) (string, string, bool, error) {
+func (s keychainStore) Get(key string) (string, string, bool, error) {
 	v, err := s.kr.Get(keyringService, key)
 	switch {
 	case err == nil:
@@ -146,16 +150,16 @@ func (s keychainStore) get(key string) (string, string, bool, error) {
 	case !errors.Is(err, keyring.ErrNotFound):
 		return "", "", false, keychainError(err)
 	}
-	return s.legacy.get(key)
+	return s.legacy.Get(key)
 }
 
-func (s keychainStore) addr(key string) (string, bool, error) {
+func (s keychainStore) Addr(key string) (string, bool, error) {
 	ok, err := s.kr.Has(keyringService, key)
 	switch {
 	case err != nil:
 		return "", false, keychainError(err)
 	case !ok:
-		return s.legacy.addr(key)
+		return s.legacy.Addr(key)
 	}
 	b, err := os.ReadFile(s.addrPath(key))
 	if err == nil {
@@ -165,21 +169,21 @@ func (s keychainStore) addr(key string) (string, bool, error) {
 		return "", false, err
 	}
 	// An item stored before addresses were recorded: the address is only inside it.
-	_, addr, ok, err := s.get(key)
+	_, addr, ok, err := s.Get(key)
 	return addr, ok, err
 }
 
 // set records the address first and puts the old record back if the keychain
 // refuses the token, so the record never describes a token that is not there.
-func (s keychainStore) set(key, token, addr string) error {
+func (s keychainStore) Set(key, token, addr string) error {
 	path := s.addrPath(key)
 	old, oldErr := os.ReadFile(path)
-	if err := writeFileAtomic(path, []byte(addr+"\n"), 0o600); err != nil {
+	if err := atomicfile.Write(path, []byte(addr+"\n"), 0o600); err != nil {
 		return err
 	}
 	if err := s.kr.Set(keyringService, key, encodeToken(token, addr)); err != nil {
 		if oldErr == nil {
-			_ = writeFileAtomic(path, old, 0o600)
+			_ = atomicfile.Write(path, old, 0o600)
 		} else {
 			_ = os.Remove(path)
 		}
@@ -191,10 +195,10 @@ func (s keychainStore) set(key, token, addr string) error {
 	if err := s.removeOldRecord(key); err != nil {
 		return err
 	}
-	return s.legacy.del(key)
+	return s.legacy.Del(key)
 }
 
-func (s keychainStore) del(key string) error {
+func (s keychainStore) Del(key string) error {
 	if err := s.kr.Delete(keyringService, key); err != nil && !errors.Is(err, keyring.ErrNotFound) {
 		return keychainError(err)
 	}
@@ -204,14 +208,14 @@ func (s keychainStore) del(key string) error {
 	if err := s.removeOldRecord(key); err != nil {
 		return err
 	}
-	return s.legacy.del(key)
+	return s.legacy.Del(key)
 }
 
-// tokens picks the store from VCTX_TOKEN_STORE: the keychain by default on macOS,
-// files elsewhere, since a Linux secret service is often missing on servers.
-func (a *app) tokens() (tokenStore, error) {
-	files := fileStore{dir: filepath.Join(a.stateDir, "tokens")}
-	kind := a.getenv("VCTX_TOKEN_STORE")
+// Open returns the store kind names: "keychain", "file", or "" for the
+// default (the keychain on macOS, files elsewhere, since a Linux secret
+// service is often missing on servers). kr replaces the system keychain.
+func Open(stateDir, kind string, kr SecretService) (Store, error) {
+	files := fileStore{dir: filepath.Join(stateDir, "tokens")}
 	if kind == "" {
 		kind = "file"
 		if runtime.GOOS == "darwin" {
@@ -222,39 +226,35 @@ func (a *app) tokens() (tokenStore, error) {
 	case "file":
 		return files, nil
 	case "keychain":
-		kr := a.keyring
 		if kr == nil {
 			kr = systemKeyring{}
 		}
 		return keychainStore{
 			kr:         kr,
-			addrDir:    filepath.Join(a.stateDir, "keychain-addrs"),
+			addrDir:    filepath.Join(stateDir, "keychain-addrs"),
 			legacy:     files,
-			oldAddrDir: filepath.Join(a.stateDir, "addrs"),
+			oldAddrDir: filepath.Join(stateDir, "addrs"),
 		}, nil
 	}
 	return nil, fmt.Errorf("invalid VCTX_TOKEN_STORE %q, want file or keychain", kind)
 }
 
-type tokenState int
+// State is what a context's stored token is good for.
+type State int
 
 const (
-	tokenNone  tokenState = iota
-	tokenOK               // stored for the context's current address
-	tokenStale            // stored for another address, or without one: vault will not get it
+	None  State = iota
+	OK          // stored for the context's current address
+	Stale       // stored for another address, or without one: vault will not get it
 )
 
-// tokenStatus reports the stored token of each context; on error the map
-// still holds every answer that could be got.
-func (a *app) tokenStatus(cfg *config, names []string) (map[string]tokenState, error) {
-	out := make(map[string]tokenState, len(names))
-	store, err := a.tokens()
-	if err != nil {
-		return out, err
-	}
+// Status reports the stored token of each context; on error the map still
+// holds every answer that could be got.
+func Status(s Store, cfg *config.Config, home string, names []string) (map[string]State, error) {
+	out := make(map[string]State, len(names))
 	var errs []error
 	for _, name := range names {
-		state, err := a.tokenStateOf(store, cfg, name)
+		state, err := StateOf(s, cfg, home, name)
 		out[name] = state
 		if err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", name, err))
@@ -263,17 +263,18 @@ func (a *app) tokenStatus(cfg *config, names []string) (map[string]tokenState, e
 	return out, errors.Join(errs...)
 }
 
-func (a *app) tokenStateOf(store tokenStore, cfg *config, name string) (tokenState, error) {
-	addr, ok, err := store.addr(name)
+// StateOf reports the stored token of context name.
+func StateOf(s Store, cfg *config.Config, home, name string) (State, error) {
+	addr, ok, err := s.Addr(name)
 	if err != nil || !ok {
-		return tokenNone, err
+		return None, err
 	}
-	vars, err := cfg.vars(name, a.home)
+	vars, err := cfg.Vars(name, home)
 	if err != nil {
-		return tokenNone, err
+		return None, err
 	}
-	if addr == "" || addr != normalizeAddr(vaultAddr(vars)) {
-		return tokenStale, nil
+	if addr == "" || addr != config.NormalizeAddr(config.VaultAddr(vars)) {
+		return Stale, nil
 	}
-	return tokenOK, nil
+	return OK, nil
 }

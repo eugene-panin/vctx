@@ -1,32 +1,23 @@
-package main
+// Package shell hooks vctx into zsh, bash and fish, so that switching a
+// context switches the terminal it was typed in.
+package shell
 
 import (
 	"errors"
 	"fmt"
 	"io"
-	"maps"
 	"os"
 	"path/filepath"
 	"runtime"
-	"slices"
 	"strconv"
 	"strings"
 	"syscall"
+
+	"github.com/eugene-panin/vctx/internal/environ"
 )
 
 // initMarker labels the line `vctx init` adds.
 const initMarker = "# vctx shell integration"
-
-// The shell function learns which context vctx switched to through
-// envChoiceFD in zsh and bash: a descriptor feeding a command substitution,
-// while vctx's own output still goes to the terminal; no temporary file to
-// leave behind when Ctrl-C ends the function. fish, which cannot redirect
-// like that, passes a temporary file in envChoiceFile instead. Nothing else
-// changes the terminal's context.
-const (
-	envChoiceFD   = "VCTX_CHOICE_FD"
-	envChoiceFile = "VCTX_CHOICE_FILE"
-)
 
 // zshInit and bashInit are the integration, for interactive shells only. They
 // call vctx by absolute path, so a context whose PATH lacks vctx cannot lock
@@ -92,32 +83,43 @@ const fishInit = `if status is-interactive
 end
 `
 
-// rcFile is where `vctx init` hooks into shell: the file that shell reads for
-// every interactive session.
-func (a *app) rcFile(shell string) (string, error) {
+// Setup knows where a user's shells keep their configuration.
+type Setup struct {
+	Home       string
+	ZDotDir    string // $ZDOTDIR, empty for the home directory
+	ConfigHome string // $XDG_CONFIG_HOME or ~/.config
+	Self       string // the vctx binary the integration calls
+}
+
+// RCFile is the file shell reads for every interactive session.
+func (s Setup) RCFile(shell string) (string, error) {
 	switch shell {
 	case "zsh":
-		dir := a.getenv("ZDOTDIR")
+		dir := s.ZDotDir
 		if dir == "" {
-			dir = a.home
+			dir = s.Home
 		}
 		return filepath.Join(dir, ".zshrc"), nil
 	case "bash":
 		if runtime.GOOS != "darwin" {
-			return filepath.Join(a.home, ".bashrc"), nil
+			return filepath.Join(s.Home, ".bashrc"), nil
 		}
 		// Terminal apps on macOS start login shells. Those read the first of
 		// these that exists, so creating .bash_profile would hide the others.
 		for _, name := range []string{".bash_profile", ".bash_login", ".profile"} {
-			if p := filepath.Join(a.home, name); fileExists(p) {
+			if p := filepath.Join(s.Home, name); fileExists(p) {
 				return p, nil
 			}
 		}
-		return filepath.Join(a.home, ".bash_profile"), nil
+		return filepath.Join(s.Home, ".bash_profile"), nil
 	case "fish":
-		return filepath.Join(a.xdgDir("XDG_CONFIG_HOME", ".config"), "fish", "conf.d", "vctx.fish"), nil
+		return filepath.Join(s.ConfigHome, "fish", "conf.d", "vctx.fish"), nil
 	}
-	return "", fmt.Errorf("unsupported shell %q: vctx supports zsh, bash and fish", shell)
+	return "", unsupported(shell)
+}
+
+func unsupported(shell string) error {
+	return fmt.Errorf("unsupported shell %q: vctx supports zsh, bash and fish", shell)
 }
 
 func fileExists(path string) bool {
@@ -125,28 +127,18 @@ func fileExists(path string) bool {
 	return err == nil
 }
 
-// initLine loads the integration, and does nothing once vctx is uninstalled.
-func initLine(shell string) string {
+// InitLine loads the integration, and does nothing once vctx is uninstalled.
+func InitLine(shell string) string {
 	if shell == "fish" {
 		return "type -q vctx; and vctx init fish | source"
 	}
 	return `command -v vctx >/dev/null 2>&1 && eval "$(vctx init ` + shell + `)"`
 }
 
-// initShell hooks the integration into the rc file of the user's shell, or of
-// the one given with --shell; `vctx init <shell>` prints the integration itself.
-func (a *app) initShell(args []string) error {
-	shell := filepath.Base(a.getenv("SHELL"))
-	switch {
-	case len(args) == 0:
-	case len(args) == 2 && args[0] == "--shell":
-		shell = args[1]
-	case len(args) == 1 && !strings.HasPrefix(args[0], "-"):
-		return a.printInit(args[0])
-	default:
-		return usageError("usage: vctx init [--shell zsh|bash|fish]")
-	}
-	rc, err := a.rcFile(shell)
+// Install hooks the integration into the rc file of shell, unless it is
+// there already, and says what it did on out.
+func (s Setup) Install(shell string, out io.Writer) error {
+	rc, err := s.RCFile(shell)
 	if err != nil {
 		return err
 	}
@@ -156,7 +148,7 @@ func (a *app) initShell(args []string) error {
 	}
 	// The line itself, not the marker: it may have been added by hand, or deleted with the marker left.
 	if strings.Contains(string(b), "vctx init "+shell) {
-		fmt.Fprintf(a.stdout, "already set up in %s\n", rc)
+		fmt.Fprintf(out, "already set up in %s\n", rc)
 		return nil
 	}
 	if err := os.MkdirAll(filepath.Dir(rc), 0o755); err != nil {
@@ -166,7 +158,7 @@ func (a *app) initShell(args []string) error {
 	if err != nil {
 		return err
 	}
-	block := initMarker + "\n" + initLine(shell) + "\n"
+	block := initMarker + "\n" + InitLine(shell) + "\n"
 	if len(b) > 0 && !strings.HasSuffix(string(b), "\n") {
 		block = "\n" + block
 	}
@@ -177,51 +169,35 @@ func (a *app) initShell(args []string) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	fmt.Fprintf(a.stdout, "added to %s\nopen a new terminal; then `vctx use <context>` switches it, and vault follows\n", rc)
+	fmt.Fprintf(out, "added to %s\nopen a new terminal; then `vctx use <context>` switches it, and vault follows\n", rc)
 	return nil
 }
 
-func (a *app) printInit(shell string) error {
+// Print writes the integration for shell, what the rc line loads.
+func (s Setup) Print(shell string, out io.Writer) error {
 	switch shell {
 	case "zsh":
-		_, err := fmt.Fprintf(a.stdout, zshInit, shellQuote(a.self))
+		_, err := fmt.Fprintf(out, zshInit, environ.ShellQuote(s.Self))
 		return err
 	case "bash":
-		_, err := fmt.Fprintf(a.stdout, bashInit, shellQuote(a.self))
+		_, err := fmt.Fprintf(out, bashInit, environ.ShellQuote(s.Self))
 		return err
 	case "fish":
-		_, err := fmt.Fprintf(a.stdout, fishInit, fishQuote(a.self))
+		_, err := fmt.Fprintf(out, fishInit, environ.FishQuote(s.Self))
 		return err
 	}
-	return fmt.Errorf("unsupported shell %q: vctx supports zsh, bash and fish", shell)
+	return unsupported(shell)
 }
 
-// writeFishEnv is writeShellEnv for fish.
-func writeFishEnv(w io.Writer, environ []string, vars map[string]string) {
-	p := planEnv(environ, vars)
-	for _, k := range slices.Sorted(maps.Keys(p.unset)) {
-		if envKeyRe.MatchString(k) {
-			fmt.Fprintf(w, "set -e %s\n", k)
-		}
-	}
-	for _, k := range slices.Sorted(maps.Keys(p.set)) {
-		fmt.Fprintf(w, "set -gx %s %s\n", k, fishQuote(p.set[k]))
-	}
-}
-
-func fishQuote(s string) string {
-	return "'" + strings.NewReplacer(`\`, `\\`, `'`, `\'`).Replace(s) + "'"
-}
-
-// announceChoice tells the shell function, when it called vctx, which context
-// to switch the terminal to.
-func (a *app) announceChoice(name string) {
-	if f := choiceFD(a.environ); f != nil {
+// Announce tells the shell function, when it called vctx with osEnv, which
+// context to switch the terminal to.
+func Announce(osEnv []string, name string) {
+	if f := choiceFD(osEnv); f != nil {
 		_, _ = io.WriteString(f, name)
 		f.Close()
 		return
 	}
-	path := a.getenv(envChoiceFile)
+	path := environ.Value(osEnv, environ.ChoiceFile)
 	if path == "" {
 		return
 	}
@@ -236,10 +212,15 @@ func (a *app) announceChoice(name string) {
 	}
 }
 
+// Integrated reports whether the shell function called vctx.
+func Integrated(osEnv []string) bool {
+	return environ.Value(osEnv, environ.ChoiceFD) != "" || environ.Value(osEnv, environ.ChoiceFile) != ""
+}
+
 // choiceFD opens the descriptor named by VCTX_CHOICE_FD, if it is a pipe as
 // the shell function sets up; nil otherwise.
-func choiceFD(environ []string) *os.File {
-	fd, err := strconv.Atoi(envValue(environ, envChoiceFD))
+func choiceFD(osEnv []string) *os.File {
+	fd, err := strconv.Atoi(environ.Value(osEnv, environ.ChoiceFD))
 	if err != nil || fd < 3 || fd > 9 {
 		return nil
 	}
@@ -250,10 +231,10 @@ func choiceFD(environ []string) *os.File {
 	return f
 }
 
-// keepChoiceFD stops the choice descriptor from reaching anything vctx runs:
+// KeepChoiceFD stops the choice descriptor from reaching anything vctx runs:
 // a daemon holding it open would keep the shell function waiting.
-func keepChoiceFD(environ []string) {
-	if fd, err := strconv.Atoi(envValue(environ, envChoiceFD)); err == nil && fd >= 3 && fd <= 9 {
+func KeepChoiceFD(osEnv []string) {
+	if fd, err := strconv.Atoi(environ.Value(osEnv, environ.ChoiceFD)); err == nil && fd >= 3 && fd <= 9 {
 		syscall.CloseOnExec(fd)
 	}
 }

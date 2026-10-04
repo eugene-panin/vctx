@@ -1,4 +1,6 @@
-package main
+// Package config loads vctx's contexts: named sets of environment variables
+// for the Vault CLI, plus how to log in to each.
+package config
 
 import (
 	"bytes"
@@ -18,7 +20,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-type config struct {
+type Config struct {
 	Defaults map[string]string            `yaml:"defaults"`
 	Contexts map[string]map[string]string `yaml:"contexts"`
 }
@@ -31,7 +33,17 @@ var (
 	reservedNames = []string{"help", "ui", "init", "ls", "list", "use", "current", "env", "exec", "check", "logout", "get", "store", "erase"}
 )
 
-func loadConfig(path string) (*config, error) {
+// DefaultAddr is where the Vault CLI goes without VAULT_ADDR.
+const DefaultAddr = "https://127.0.0.1:8200"
+
+// ValidName reports whether name can be a context name; names end up in file paths.
+func ValidName(name string) bool { return nameRe.MatchString(name) }
+
+// ValidKey reports whether k can be an environment variable name.
+func ValidKey(k string) bool { return envKeyRe.MatchString(k) }
+
+// Load reads and checks the config at path.
+func Load(path string) (*Config, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
@@ -41,7 +53,7 @@ func loadConfig(path string) (*config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
-	if err := checkPrivate(path, fi); err != nil {
+	if err := CheckPrivate(path, fi); err != nil {
 		return nil, err
 	}
 	const maxSize = 1 << 20
@@ -53,7 +65,7 @@ func loadConfig(path string) (*config, error) {
 		return nil, fmt.Errorf("%s: larger than %d bytes", path, maxSize)
 	}
 
-	var c config
+	var c Config
 	dec := yaml.NewDecoder(bytes.NewReader(b))
 	dec.KnownFields(true)
 	if err := dec.Decode(&c); err != nil && !errors.Is(err, io.EOF) {
@@ -78,16 +90,16 @@ func loadConfig(path string) (*config, error) {
 		if err := checkVars(c.Contexts[name]); err != nil {
 			return nil, fmt.Errorf("%s: context %s: %w", path, name, err)
 		}
-		if vars, _ := c.vars(name, ""); vaultAddr(vars) == "" {
+		if vars, _ := c.Vars(name, ""); VaultAddr(vars) == "" {
 			return nil, fmt.Errorf("%s: context %s: VAULT_ADDR or VAULT_AGENT_ADDR is required", path, name)
 		}
 	}
 	return &c, nil
 }
 
-// addrFrom picks the address vault talks to and the variable it came from:
+// AddrFrom picks the address vault talks to and the variable it came from:
 // VAULT_AGENT_ADDR wins over VAULT_ADDR, as in the Vault CLI.
-func addrFrom(get func(string) string) (addr, from string) {
+func AddrFrom(get func(string) string) (addr, from string) {
 	for _, k := range []string{"VAULT_AGENT_ADDR", "VAULT_ADDR"} {
 		if v := get(k); v != "" {
 			return v, k
@@ -96,21 +108,22 @@ func addrFrom(get func(string) string) (addr, from string) {
 	return "", ""
 }
 
-func vaultAddr(vars map[string]string) string {
-	addr, _ := addrFrom(func(k string) string { return vars[k] })
+// VaultAddr is the address vault talks to with vars.
+func VaultAddr(vars map[string]string) string {
+	addr, _ := AddrFrom(func(k string) string { return vars[k] })
 	return addr
 }
 
-// normalizeAddr is how addresses are compared and stored with tokens.
-func normalizeAddr(addr string) string {
+// NormalizeAddr is how addresses are compared and stored with tokens.
+func NormalizeAddr(addr string) string {
 	if addr == "" {
-		addr = defaultVaultAddr
+		addr = DefaultAddr
 	}
 	return strings.TrimRight(addr, "/")
 }
 
-// redactAddr hides credentials in an address for display, even one url.Parse rejects.
-func redactAddr(s string) string {
+// RedactAddr hides credentials in an address for display, even one url.Parse rejects.
+func RedactAddr(s string) string {
 	if u, err := url.Parse(s); err == nil {
 		return u.Redacted()
 	}
@@ -121,10 +134,10 @@ func redactAddr(s string) string {
 	return s
 }
 
-// checkPrivate refuses a file or directory another user could modify, as ssh does:
+// CheckPrivate refuses a file or directory another user could modify, as ssh does:
 // the config decides which variables (PATH included) vault runs with, and the
 // state directory holds the token helper setting vault executes.
-func checkPrivate(path string, fi fs.FileInfo) error {
+func CheckPrivate(path string, fi fs.FileInfo) error {
 	if perm := fi.Mode().Perm(); perm&0o022 != 0 {
 		return fmt.Errorf("%s is writable by group or others (mode %04o), fix with: chmod go-w %s", path, perm, path)
 	}
@@ -141,7 +154,7 @@ const loginKey = "login"
 func checkVars(vars map[string]string) error {
 	for _, k := range slices.Sorted(maps.Keys(vars)) {
 		if k == loginKey {
-			if _, err := loginArgs(vars[k]); err != nil {
+			if _, err := LoginArgs(vars[k]); err != nil {
 				return fmt.Errorf("login: %w", err)
 			}
 			continue
@@ -156,8 +169,8 @@ func checkVars(vars map[string]string) error {
 	return nil
 }
 
-// vars returns the variables of context name merged over the defaults, with a leading ~/ expanded.
-func (c *config) vars(name, home string) (map[string]string, error) {
+// Vars returns the variables of context name merged over the defaults, with a leading ~/ expanded.
+func (c *Config) Vars(name, home string) (map[string]string, error) {
 	ctx, ok := c.Contexts[name]
 	if !ok {
 		return nil, fmt.Errorf("unknown context %q", name)
@@ -173,14 +186,14 @@ func (c *config) vars(name, home string) (map[string]string, error) {
 	return out, nil
 }
 
-// login returns the `vault login` arguments configured for context name, from
+// Login returns the `vault login` arguments configured for context name, from
 // the context or the defaults; nil when none are.
-func (c *config) login(name string) []string {
+func (c *Config) Login(name string) []string {
 	v, ok := c.Contexts[name][loginKey]
 	if !ok {
 		v = c.Defaults[loginKey]
 	}
-	args, _ := loginArgs(v) // validated by loadConfig
+	args, _ := LoginArgs(v) // validated by loadConfig
 	return args
 }
 

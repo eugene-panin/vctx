@@ -1,9 +1,9 @@
-package main
+package tui
 
 import (
+	"bytes"
 	"errors"
 	"maps"
-	"os"
 	"slices"
 	"strings"
 	"testing"
@@ -12,6 +12,11 @@ import (
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/eugene-panin/vctx/internal/config"
+	"github.com/eugene-panin/vctx/internal/probe"
+	"github.com/eugene-panin/vctx/internal/status"
+	"github.com/eugene-panin/vctx/internal/token"
+	"github.com/eugene-panin/vctx/internal/vaulttest"
 )
 
 func TestFitColumns(t *testing.T) {
@@ -42,22 +47,79 @@ func TestFitColumns(t *testing.T) {
 	}
 }
 
-func newTestModel(t *testing.T) (*model, *app) {
+// fakeBackend keeps what the UI asks for in memory.
+type fakeBackend struct {
+	current string
+	tokens  map[string]token.State
+	logins  map[string][]string
+	forgot  []string
+}
+
+func newFakeBackend() *fakeBackend {
+	return &fakeBackend{tokens: map[string]token.State{}, logins: map[string][]string{}}
+}
+
+func (f *fakeBackend) Current() string                  { return f.current }
+func (f *fakeBackend) Use(name string) error            { f.current = name; return nil }
+func (f *fakeBackend) LoginMethod(name string) []string { return f.logins[name] }
+func (f *fakeBackend) Getenv(string) string             { return "" }
+func (f *fakeBackend) Login(string) tea.ExecCommand     { return nil }
+
+func (f *fakeBackend) TokenStatus(names []string) (map[string]token.State, error) {
+	out := make(map[string]token.State, len(names))
+	for _, n := range names {
+		out[n] = f.tokens[n]
+	}
+	return out, nil
+}
+
+func (f *fakeBackend) Forget(name string) error {
+	delete(f.tokens, name)
+	f.forgot = append(f.forgot, name)
+	return nil
+}
+
+func (f *fakeBackend) CommandEnv(map[string]string) ([]string, error) {
+	return []string{"PATH=/usr/bin:/bin"}, nil
+}
+
+// testConfig mirrors the CLI tests' config: dev and prod, with a default.
+var testConfig = &config.Config{
+	Defaults: map[string]string{"VAULT_FORMAT": "json"},
+	Contexts: map[string]map[string]string{
+		"dev":  {"VAULT_ADDR": "http://127.0.0.1:8201", "VAULT_CACERT": "~/ca.pem"},
+		"prod": {"VAULT_ADDR": "https://vault.example.com", "VAULT_NAMESPACE": "admin", "HTTPS_PROXY": "http://proxy:3128"},
+	},
+}
+
+func prepare(t *testing.T, cfg *config.Config) []status.Context {
 	t.Helper()
-	a, _, _ := newTestApp(t)
-	cfg, err := a.loadConfig()
-	if err != nil {
-		t.Fatal(err)
+	var out []status.Context
+	for _, name := range slices.Sorted(maps.Keys(cfg.Contexts)) {
+		c, err := status.Prepare(cfg, name, []string{"PATH=/usr/bin:/bin"}, "/home/u")
+		if err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, c)
 	}
-	m, err := newModel(a, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	m.rows[0].status.probeResult = probeResult{health: &health{Initialized: true, Version: "1.20.4"}, latency: 280 * time.Millisecond}
+	return out
+}
+
+func newModelFor(t *testing.T, cfg *config.Config) (*model, *fakeBackend) {
+	t.Helper()
+	b := newFakeBackend()
+	return newModel(b, prepare(t, cfg), time.Second, &bytes.Buffer{}), b
+}
+
+// newTestModel has dev answered as active and prod blocked by an ingress.
+func newTestModel(t *testing.T) (*model, *fakeBackend) {
+	t.Helper()
+	m, b := newModelFor(t, testConfig)
+	m.rows[0].Status.Result = probe.Result{Health: &probe.Health{Initialized: true, Version: "1.20.4"}, Latency: 280 * time.Millisecond}
 	m.rows[0].probing = false
-	m.rows[1].status.probeResult = probeResult{err: &notVaultError{status: 403, contentType: "text/html"}}
+	m.rows[1].Status.Result = probe.Result{Err: &probe.NotVaultError{Status: 403, ContentType: "text/html"}}
 	m.rows[1].probing = false
-	return m, a
+	return m, b
 }
 
 func TestViewFitsWindow(t *testing.T) {
@@ -85,15 +147,7 @@ func TestViewFitsWindow(t *testing.T) {
 }
 
 func TestViewWhileProbing(t *testing.T) {
-	a, _, _ := newTestApp(t)
-	cfg, err := a.loadConfig()
-	if err != nil {
-		t.Fatal(err)
-	}
-	m, err := newModel(a, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
+	m, _ := newModelFor(t, testConfig)
 	m.Init() // marks every row as probing; the probes themselves are not run
 	for _, w := range []int{60, 150} {
 		m.Update(tea.WindowSizeMsg{Width: w, Height: 24})
@@ -104,7 +158,7 @@ func TestViewWhileProbing(t *testing.T) {
 }
 
 func TestEnterMakesDefault(t *testing.T) {
-	m, a := newTestModel(t)
+	m, b := newTestModel(t)
 	m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
 	m.Update(tea.KeyMsg{Type: tea.KeyDown})
 	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
@@ -114,16 +168,14 @@ func TestEnterMakesDefault(t *testing.T) {
 	if _, ok := cmd().(tea.QuitMsg); !ok {
 		t.Error("enter did not quit")
 	}
-	if name, _ := a.contextName(""); name != "prod" {
-		t.Errorf("default = %q, want prod", name)
+	if b.current != "prod" {
+		t.Errorf("default = %q, want prod", b.current)
 	}
 }
 
 func TestForgetToken(t *testing.T) {
-	m, a := newTestModel(t)
-	if err := writeFileAtomic(a.tokenPath("dev"), []byte("t"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	m, b := newTestModel(t)
+	b.tokens["dev"] = token.OK
 	m.Update(m.loadTokens()()) // as after a login
 	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
 	if cmd == nil {
@@ -131,11 +183,11 @@ func TestForgetToken(t *testing.T) {
 	}
 	_, cmd = m.Update(cmd())
 	m.Update(cmd())
-	if m.tokens["dev"] != tokenNone {
+	if m.tokens["dev"] != token.None {
 		t.Error("token still shown")
 	}
-	if _, err := os.Stat(a.tokenPath("dev")); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("token still present: %v", err)
+	if !slices.Equal(b.forgot, []string{"dev"}) {
+		t.Errorf("forgot = %q", b.forgot)
 	}
 	if !m.flashOK || !strings.Contains(m.flash, "forgotten") {
 		t.Errorf("flash = %q", m.flash)
@@ -147,13 +199,13 @@ func TestStaleProbeIgnored(t *testing.T) {
 	m.probe(0)
 	stale := m.rows[0].gen
 	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
-	m.Update(probeMsg{i: 0, gen: stale, res: probeResult{err: errors.New("old")}})
-	if !m.rows[0].probing || m.rows[0].status.err != nil {
-		t.Errorf("stale answer applied: probing=%v err=%v", m.rows[0].probing, m.rows[0].status.err)
+	m.Update(probeMsg{i: 0, gen: stale, res: probe.Result{Err: errors.New("old")}})
+	if !m.rows[0].probing || m.rows[0].Status.Err != nil {
+		t.Errorf("stale answer applied: probing=%v err=%v", m.rows[0].probing, m.rows[0].Status.Err)
 	}
-	m.Update(probeMsg{i: 0, gen: m.rows[0].gen, res: probeResult{err: errors.New("new")}})
-	if m.rows[0].probing || m.rows[0].status.err == nil || m.rows[0].status.err.Error() != "new" {
-		t.Errorf("current answer not applied: probing=%v err=%v", m.rows[0].probing, m.rows[0].status.err)
+	m.Update(probeMsg{i: 0, gen: m.rows[0].gen, res: probe.Result{Err: errors.New("new")}})
+	if m.rows[0].probing || m.rows[0].Status.Err == nil || m.rows[0].Status.Err.Error() != "new" {
+		t.Errorf("current answer not applied: probing=%v err=%v", m.rows[0].probing, m.rows[0].Status.Err)
 	}
 }
 
@@ -192,38 +244,26 @@ func TestScrollKeepsCursorVisible(t *testing.T) {
 }
 
 func TestStaleTokenStatusIgnored(t *testing.T) {
-	m, a := newTestModel(t)
-	if err := writeFileAtomic(a.tokenPath("dev"), []byte("x"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	m, b := newTestModel(t)
+	b.tokens["dev"] = token.OK
 	slow := m.loadTokens()() // started before the token is forgotten, answers after
 	m.Update(m.loadTokens()())
 	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
 	_, cmd = m.Update(cmd())
 	m.Update(slow)
 	m.Update(cmd())
-	if m.tokens["dev"] != tokenNone {
+	if m.tokens["dev"] != token.None {
 		t.Error("late token status brought a forgotten token back")
 	}
 }
 
 func TestRefreshRetriesConfigErrorsFromProbe(t *testing.T) {
-	a, _, _ := newTestApp(t)
-	cfg := "contexts:\n  x:\n    VAULT_ADDR: https://127.0.0.1:1\n    VAULT_CACERT: /nonexistent/ca.pem\n"
-	if err := os.WriteFile(a.configPath, []byte(cfg), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	c, err := a.loadConfig()
-	if err != nil {
-		t.Fatal(err)
-	}
-	m, err := newModel(a, c)
-	if err != nil {
-		t.Fatal(err)
-	}
+	m, _ := newModelFor(t, &config.Config{Contexts: map[string]map[string]string{
+		"x": {"VAULT_ADDR": "https://127.0.0.1:1", "VAULT_CACERT": "/nonexistent/ca.pem"},
+	}})
 	cmd := m.probe(0)
 	m.Update(cmd())
-	if short, _ := m.rows[0].status.shortSummary(); short != "config error" {
+	if short, _ := m.rows[0].Status.Short(); short != "config error" {
 		t.Fatalf("status = %q", short)
 	}
 	gen := m.rows[0].gen
@@ -254,17 +294,13 @@ func drain(t *testing.T, m *model, cmd tea.Cmd, depth int) {
 }
 
 func TestEveryKeyOnEveryKindOfContext(t *testing.T) {
-	a, _, _ := newTestApp(t)
-	ok := serve(t, vaultHandler(200, activeBody))
-	cfg := "contexts:\n" +
-		"  ok:\n    VAULT_ADDR: " + ok + "\n" +
-		"  badaddr:\n    VAULT_ADDR: vault.example.com:8200\n" +
-		"  down:\n    VAULT_ADDR: " + closedURL(t) + "\n" +
-		"  noca:\n    VAULT_ADDR: " + ok + "\n    VAULT_CACERT: /nonexistent/ca.pem\n"
-	if err := os.WriteFile(a.configPath, []byte(cfg), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	c := loadTestConfig(t, a)
+	ok := vaulttest.Serve(t, vaulttest.Handler(200, vaulttest.ActiveBody))
+	c := &config.Config{Contexts: map[string]map[string]string{
+		"ok":      {"VAULT_ADDR": ok},
+		"badaddr": {"VAULT_ADDR": "vault.example.com:8200"},
+		"down":    {"VAULT_ADDR": vaulttest.ClosedURL(t)},
+		"noca":    {"VAULT_ADDR": ok, "VAULT_CACERT": "/nonexistent/ca.pem"},
+	}}
 	press := func(s string) tea.KeyMsg {
 		switch s {
 		case "down":
@@ -278,20 +314,15 @@ func TestEveryKeyOnEveryKindOfContext(t *testing.T) {
 	}
 
 	for row := range 4 {
+		m, b := newModelFor(t, c)
 		for _, name := range slices.Sorted(maps.Keys(c.Contexts)) {
-			if err := writeFileAtomic(a.tokenPath(name), []byte("http://x\nt\n"), 0o600); err != nil {
-				t.Fatal(err)
-			}
-		}
-		m, err := newModel(a, c)
-		if err != nil {
-			t.Fatal(err)
+			b.tokens[name] = token.Stale
 		}
 		m.spin.Spinner.FPS = time.Microsecond
 		m.Update(tea.WindowSizeMsg{Width: 120, Height: 24})
 		drain(t, m, m.Init(), 0)
 		m.cursor = row
-		name := m.rows[row].status.name
+		name := m.rows[row].Status.Name
 		for _, k := range []string{"r", "l", "s", "x", "down", "up", "enter"} {
 			_, cmd := m.Update(press(k))
 			drain(t, m, cmd, 0)
@@ -306,22 +337,16 @@ func TestEveryKeyOnEveryKindOfContext(t *testing.T) {
 				}
 			}
 		}
-		if want := m.rows[m.cursor].status.name; m.chosen != want {
+		if want := m.rows[m.cursor].Status.Name; m.chosen != want {
 			t.Errorf("%s: enter chose %q, cursor on %q", name, m.chosen, want)
 		}
 	}
 }
 
 func TestMultilineValueInDetails(t *testing.T) {
-	a, _, _ := newTestApp(t)
-	cfg := "contexts:\n  x:\n    VAULT_ADDR: http://v\n    VAULT_CACERT_BYTES: |\n      -----BEGIN CERTIFICATE-----\n      MIIB\n      -----END CERTIFICATE-----\n"
-	if err := os.WriteFile(a.configPath, []byte(cfg), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	m, err := newModel(a, loadTestConfig(t, a))
-	if err != nil {
-		t.Fatal(err)
-	}
+	m, _ := newModelFor(t, &config.Config{Contexts: map[string]map[string]string{
+		"x": {"VAULT_ADDR": "http://v", "VAULT_CACERT_BYTES": "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"},
+	}})
 	m.Update(tea.WindowSizeMsg{Width: 150, Height: 30})
 	view := m.View()
 	if !strings.Contains(view, "VAULT_CACERT_BYTES=-----BEGIN CERTIFICATE-----…") || strings.Contains(view, "MIIB") {
@@ -330,16 +355,34 @@ func TestMultilineValueInDetails(t *testing.T) {
 }
 
 func TestForgetBeforeStatusLoads(t *testing.T) {
-	m, a := newTestModel(t)
-	if err := writeFileAtomic(a.tokenPath("dev"), []byte("http://127.0.0.1:8201\nt\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	m, b := newTestModel(t)
+	b.tokens["dev"] = token.OK
 	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
 	if cmd == nil {
 		t.Fatalf("x refused before token status loaded: %q", m.flash)
 	}
 	m.Update(cmd())
-	if _, err := os.Stat(a.tokenPath("dev")); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("token not forgotten: %v", err)
+	if !slices.Equal(b.forgot, []string{"dev"}) {
+		t.Errorf("forgot = %q", b.forgot)
+	}
+}
+
+func TestBadAddressShown(t *testing.T) {
+	m, _ := newModelFor(t, &config.Config{Contexts: map[string]map[string]string{
+		"noscheme": {"VAULT_ADDR": "vault.example.com:8200"},
+	}})
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 20})
+	if view := m.View(); !strings.Contains(view, "config error") {
+		t.Errorf("UI:\n%s", view)
+	}
+}
+
+func TestDetailShowsLoginMethod(t *testing.T) {
+	b := newFakeBackend()
+	b.logins["dev"] = []string{"-method=oidc", "-path=sso"}
+	m := newModel(b, prepare(t, testConfig), time.Second, &bytes.Buffer{})
+	m.Update(tea.WindowSizeMsg{Width: 150, Height: 30})
+	if view := m.View(); !strings.Contains(view, "-method=oidc -path=sso") {
+		t.Errorf("details:\n%s", view)
 	}
 }

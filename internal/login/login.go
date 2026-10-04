@@ -1,4 +1,6 @@
-package main
+// Package login makes sure a context has a working Vault token, logging in
+// with the Vault CLI when it has none. vault asks for the credential itself.
+package login
 
 import (
 	"bufio"
@@ -15,125 +17,41 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode"
 
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/eugene-panin/vctx/internal/atomicfile"
+	"github.com/eugene-panin/vctx/internal/config"
+	"github.com/eugene-panin/vctx/internal/environ"
+	"github.com/eugene-panin/vctx/internal/probe"
+	"github.com/eugene-panin/vctx/internal/style"
+	"github.com/eugene-panin/vctx/internal/termsafe"
+	"github.com/eugene-panin/vctx/internal/token"
 	"github.com/muesli/cancelreader"
 )
 
-// loginFlags are the only vault login flags a login setting may carry: the
-// others either change the server, namespace or output (-address, -namespace,
-// -no-print=false, -output-curl-string) or carry a secret (-header, -mfa).
-var loginFlags = []string{"method", "path"}
-
-// secretKeyParts mark key=value arguments that carry a credential; vault asks
-// for those itself, and the config is no place for them.
-var secretKeyParts = []string{"secret", "password", "passcode", "token", "key", "jwt", "totp", "credential"}
-
-// secretKey reports a key=value argument that carries a credential. A path or
-// file naming one (keytab_path, krb5conf_path) is not a secret itself.
-func secretKey(key string) bool {
-	lower := strings.ToLower(key)
-	if strings.HasSuffix(lower, "_path") || strings.HasSuffix(lower, "_file") {
-		return false
-	}
-	for _, part := range secretKeyParts {
-		if strings.Contains(lower, part) {
-			return true
-		}
-	}
-	return false
-}
-
-// loginArgs splits the login setting of a context into `vault login`
-// arguments, the way a shell would for simple quoting, and checks them.
-func loginArgs(s string) ([]string, error) {
-	args, err := splitArgs(s)
-	if err != nil {
-		return nil, err
-	}
-	return normalizeLoginArgs(args)
-}
-
-// normalizeLoginArgs checks login arguments and writes each flag as
-// -name=value. Flags must come first: vault ignores them after key=value.
-func normalizeLoginArgs(args []string) ([]string, error) {
-	var out []string
-	seenKV := false
-	for i := 0; i < len(args); i++ {
-		arg := args[i]
-		if strings.HasPrefix(arg, "-") {
-			if seenKV {
-				return nil, fmt.Errorf("%s: put flags before key=value arguments, vault ignores them after", arg)
-			}
-			name, value, hasValue := strings.Cut(strings.TrimLeft(arg, "-"), "=")
-			if !slices.Contains(loginFlags, name) {
-				return nil, fmt.Errorf("%s: only -method and -path are allowed here", arg)
-			}
-			if !hasValue && i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") && !strings.Contains(args[i+1], "=") {
-				i++
-				value = args[i]
-			}
-			if value == "" {
-				return nil, fmt.Errorf("-%s needs a value", name)
-			}
-			out = append(out, "-"+name+"="+value)
-			continue
-		}
-		key, _, hasValue := strings.Cut(arg, "=")
-		if !hasValue {
-			return nil, fmt.Errorf("%q: write -flag=value or key=value; vault would take a bare word as a token", arg)
-		}
-		if secretKey(key) {
-			return nil, fmt.Errorf("%s= looks like a secret; leave it out, vault asks for it", key)
-		}
-		seenKV = true
-		out = append(out, arg)
-	}
-	return out, nil
-}
-
-// splitArgs splits s at white space (newlines included) outside single or double quotes.
-func splitArgs(s string) ([]string, error) {
-	var args []string
-	var cur strings.Builder
-	var quote rune
-	inArg := false
-	for _, r := range s {
-		switch {
-		case quote != 0 && r == quote:
-			quote = 0
-		case quote != 0:
-			cur.WriteRune(r)
-		case r == '\'' || r == '"':
-			quote, inArg = r, true
-		case unicode.IsSpace(r):
-			if inArg {
-				args = append(args, cur.String())
-				cur.Reset()
-				inArg = false
-			}
-		default:
-			cur.WriteRune(r)
-			inArg = true
-		}
-	}
-	if quote != 0 {
-		return nil, errors.New("unterminated quote")
-	}
-	if inArg {
-		args = append(args, cur.String())
-	}
-	return args, nil
+// Runner logs in to contexts. Its fields are what vctx knows about the
+// environment it runs in.
+type Runner struct {
+	Environ     []string
+	Home        string
+	StateDir    string
+	Self        string // the vctx binary, vault's token helper
+	VaultBin    string
+	Timeout     time.Duration // probe timeout; probe.DefaultTimeout when zero
+	Tokens      func() (token.Store, error)
+	In          io.Reader
+	Out         io.Writer // where vctx reports and asks, stderr for the CLI
+	Interactive bool      // In and Out are a terminal: there is someone to ask
 }
 
 // errCancelled is a login given up with Ctrl-C.
 var errCancelled = errors.New("cancelled")
 
-// interruptible catches Ctrl-C until stop is called. The terminal sends
+// Interruptible catches Ctrl-C until stop is called. The terminal sends
 // SIGINT to the whole foreground group: vault, when it runs, handles it
 // itself, and vctx turns it into cancelling ctx instead of dying, so it can
 // still report and the shell function still switches the terminal.
-func interruptible() (ctx context.Context, stop func()) {
+func Interruptible() (ctx context.Context, stop func()) {
 	return signal.NotifyContext(context.Background(), os.Interrupt)
 }
 
@@ -175,8 +93,8 @@ func (a *answers) ask(out io.Writer, prompt, def string) (string, error) {
 }
 
 // runVault runs vault with env and the terminal, for a short check; its output is returned.
-func (a *app) runVault(ctx context.Context, env []string, args ...string) ([]byte, error) {
-	bin, err := lookPath(a.vaultBin(), env)
+func (r *Runner) runVault(ctx context.Context, env []string, args ...string) ([]byte, error) {
+	bin, err := environ.LookPath(r.VaultBin, env)
 	if err != nil {
 		return nil, err
 	}
@@ -192,8 +110,8 @@ func (a *app) runVault(ctx context.Context, env []string, args ...string) ([]byt
 // same bare 403 as a working token that may not look itself up (no default
 // policy), which counts as working. It is an error, not a no, when vault could
 // not tell.
-func (a *app) tokenWorks(ctx context.Context, env []string) (bool, error) {
-	out, err := a.runVault(ctx, env, "token", "lookup", "-format=json")
+func (r *Runner) tokenWorks(ctx context.Context, env []string) (bool, error) {
+	out, err := r.runVault(ctx, env, "token", "lookup", "-format=json")
 	text := string(out)
 	switch {
 	case err == nil:
@@ -210,8 +128,8 @@ func (a *app) tokenWorks(ctx context.Context, env []string) (bool, error) {
 
 // vaultHasToken asks vault whether it has a token at all with env, for a
 // context whose token helper is not vctx. The token is read, never shown.
-func (a *app) vaultHasToken(ctx context.Context, env []string) (bool, error) {
-	bin, err := lookPath(a.vaultBin(), env)
+func (r *Runner) vaultHasToken(ctx context.Context, env []string) (bool, error) {
+	bin, err := environ.LookPath(r.VaultBin, env)
 	if err != nil {
 		return false, err
 	}
@@ -245,19 +163,19 @@ func vaultError(out string) string {
 	if code == "" && reason == "" {
 		code, _, _ = strings.Cut(strings.TrimSpace(out), "\n")
 	}
-	return sanitize(strings.TrimSpace(code+" "+reason), 200)
+	return termsafe.String(strings.TrimSpace(code+" "+reason), 200)
 }
 
-// ensureLogin makes sure context name has a working token after `vctx use`:
+// Ensure makes sure context name has a working token after `vctx use`:
 // with none, or one vault refuses, it logs in. It only reports problems: the
 // switch has happened either way. ctx ends with Ctrl-C.
-func (a *app) ensureLogin(ctx context.Context, cfg *config, name string) {
-	if !a.stdinTTY || !a.stderrTTY {
+func (r *Runner) Ensure(ctx context.Context, cfg *config.Config, name string) {
+	if !r.Interactive {
 		return // nothing to ask in a script
 	}
-	p := newPalette(a.stderr)
+	p := style.New(r.Out)
 	warn := func(format string, args ...any) {
-		fmt.Fprintln(a.stderr, p.warn.Render("  "+fmt.Sprintf(format, args...)))
+		fmt.Fprintln(r.Out, p.Warn.Render("  "+fmt.Sprintf(format, args...)))
 	}
 	report := func(err error) {
 		if errors.Is(err, errCancelled) {
@@ -266,12 +184,12 @@ func (a *app) ensureLogin(ctx context.Context, cfg *config, name string) {
 		}
 		warn("%v", err)
 	}
-	env, err := a.helperEnv(cfg, name)
+	env, err := r.helperEnv(cfg, name)
 	if err != nil {
 		report(err)
 		return
 	}
-	if ok, why := a.loginPossible(ctx, env); !ok {
+	if ok, why := r.loginPossible(ctx, env); !ok {
 		if ctx.Err() != nil {
 			report(errCancelled)
 			return
@@ -279,7 +197,7 @@ func (a *app) ensureLogin(ctx context.Context, cfg *config, name string) {
 		warn("not logging in: %s", why)
 		return
 	}
-	vars, err := cfg.vars(name, a.home)
+	vars, err := cfg.Vars(name, r.Home)
 	if err != nil {
 		report(err)
 		return
@@ -291,7 +209,7 @@ func (a *app) ensureLogin(ctx context.Context, cfg *config, name string) {
 		return // vault agent authenticates for vault; nothing to log in to
 	case vars["VAULT_TOKEN"] != "":
 		// vault takes the token from the context; a login would not change it.
-		if ok, err := a.tokenWorks(ctx, env); err != nil {
+		if ok, err := r.tokenWorks(ctx, env); err != nil {
 			report(err)
 		} else if !ok {
 			warn("vault refuses the token from VAULT_TOKEN for %s", name)
@@ -299,14 +217,14 @@ func (a *app) ensureLogin(ctx context.Context, cfg *config, name string) {
 		return
 	case vars["VAULT_CONFIG_PATH"] != "":
 		// The context brings its own token helper, so vctx's store tells nothing.
-		has, err := a.vaultHasToken(ctx, env)
+		has, err := r.vaultHasToken(ctx, env)
 		if err != nil {
 			report(err)
 			return
 		}
 		reason = "no token yet"
 		if has {
-			ok, err := a.tokenWorks(ctx, env)
+			ok, err := r.tokenWorks(ctx, env)
 			if err != nil {
 				report(err)
 				return
@@ -317,22 +235,22 @@ func (a *app) ensureLogin(ctx context.Context, cfg *config, name string) {
 			reason = "the token expired"
 		}
 	default:
-		store, err := a.tokens()
+		store, err := r.Tokens()
 		if err != nil {
 			report(err)
 			return
 		}
-		state, err := a.tokenStateOf(store, cfg, name)
+		state, err := token.StateOf(store, cfg, r.Home, name)
 		if err != nil {
 			report(err)
 			return
 		}
 		reason = "no token yet"
 		switch state {
-		case tokenStale:
+		case token.Stale:
 			reason = "the token is for another address"
-		case tokenOK:
-			ok, err := a.tokenWorks(ctx, env)
+		case token.OK:
+			ok, err := r.tokenWorks(ctx, env)
 			if err != nil {
 				report(err)
 				return
@@ -343,7 +261,7 @@ func (a *app) ensureLogin(ctx context.Context, cfg *config, name string) {
 			reason = "the token expired"
 		}
 	}
-	if err := a.login(ctx, cfg, name, reason, env, a.stdin, a.stderr); err != nil {
+	if err := r.login(ctx, cfg, name, reason, env, r.In, r.Out); err != nil {
 		if errors.Is(err, errCancelled) {
 			report(err)
 			return
@@ -354,75 +272,75 @@ func (a *app) ensureLogin(ctx context.Context, cfg *config, name string) {
 
 // loginPossible probes the instance: a login only makes sense against one
 // that answers and can serve requests (not sealed, TLS working).
-func (a *app) loginPossible(ctx context.Context, env []string) (bool, string) {
-	t, err := targetFor(env)
+func (r *Runner) loginPossible(ctx context.Context, env []string) (bool, string) {
+	t, err := probe.TargetFor(env)
 	if err != nil {
-		_, long := classify(err)
+		_, long := probe.Classify(err)
 		return false, long
 	}
-	timeout, _ := a.checkTimeout()
+	timeout := r.Timeout
 	if timeout == 0 {
-		timeout = defaultCheckTimeout
+		timeout = probe.DefaultTimeout
 	}
-	r := probe(ctx, t, env, timeout)
+	res := probe.Probe(ctx, t, env, timeout)
 	switch {
-	case r.err != nil:
-		_, long := classify(r.err)
+	case res.Err != nil:
+		_, long := probe.Classify(res.Err)
 		return false, long
-	case !r.health.usable():
-		return false, "the server is " + r.health.String()
+	case !res.Health.Usable():
+		return false, "the server is " + res.Health.String()
 	}
 	return true, ""
 }
 
 // helperEnv is the environment vault runs with for context name, vctx being its token helper.
-func (a *app) helperEnv(cfg *config, name string) ([]string, error) {
-	vars, err := a.contextVars(cfg, name)
+func (r *Runner) helperEnv(cfg *config.Config, name string) ([]string, error) {
+	vars, err := environ.ContextVars(cfg, name, r.Home)
 	if err != nil {
 		return nil, err
 	}
-	if err := a.registerHelper(vars); err != nil {
+	if err := environ.RegisterHelper(vars, r.StateDir, r.Self); err != nil {
 		return nil, err
 	}
-	return applyEnv(a.environ, vars), nil
+	return environ.Apply(r.Environ, vars), nil
 }
 
 // login runs `vault login` for context name. The method comes from the
 // config, or from the answers given the last time; with neither it asks, and
 // remembers the answers once a login with them succeeds. When a remembered
 // method fails, it offers to choose another.
-func (a *app) login(ctx context.Context, cfg *config, name, reason string, env []string, in io.Reader, out io.Writer) error {
-	p := newPalette(out)
+func (r *Runner) login(ctx context.Context, cfg *config.Config, name, reason string, env []string, in io.Reader, out io.Writer) error {
+	p := style.New(out)
 	ans := newAnswers(ctx, in)
 	defer ans.close()
 
-	args, fromConfig := cfg.login(name), true
+	args, fromConfig := cfg.Login(name), true
 	if args == nil {
-		args, fromConfig = a.rememberedLogin(name), false
+		args, fromConfig = r.Remembered(name), false
 	}
 	asked := false
 	if args == nil {
-		fmt.Fprintf(out, "%s %s: %s. How do you log in?\n", p.accent.Render("●"), p.bold.Render(name), reason)
+		fmt.Fprintf(out, "%s %s: %s. How do you log in?\n", p.Accent.Render("●"), p.Bold.Render(name), reason)
 		var err error
-		if args, err = askLogin(ans, out, a.getenv("USER")); err != nil {
+		if args, err = askLogin(ans, out, environ.Value(r.Environ, "USER")); err != nil {
 			return err
 		}
 		asked = true
 	} else {
-		fmt.Fprintln(out, p.dim.Render("  "+reason+", logging in: vault login "+strings.Join(args, " ")))
+		fmt.Fprintln(out, p.Dim.Render("  "+reason+", logging in: vault login "+strings.Join(args, " ")))
 	}
 
 	for {
-		err := a.vaultLogin(env, args, in, out)
+		err := r.vaultLogin(env, args, in, out)
 		switch {
 		case err == nil:
 			if asked {
-				if err := a.rememberLogin(name, args); err != nil {
-					fmt.Fprintln(out, p.warn.Render("  could not remember the login method: "+err.Error()))
+				if err := r.Remember(name, args); err != nil {
+					fmt.Fprintln(out, p.Warn.Render("  could not remember the login method: "+err.Error()))
 				}
 			}
 			// -no-print keeps the token off the screen, and vault's success message with it.
-			fmt.Fprintln(out, p.ok.Render("  logged in"))
+			fmt.Fprintln(out, p.OK.Render("  logged in"))
 			return nil
 		case ctx.Err() != nil:
 			return errCancelled
@@ -437,7 +355,7 @@ func (a *app) login(ctx context.Context, cfg *config, name, reason string, env [
 		if !strings.EqualFold(again, "y") {
 			return err
 		}
-		if args, err = askLogin(ans, out, a.getenv("USER")); err != nil {
+		if args, err = askLogin(ans, out, environ.Value(r.Environ, "USER")); err != nil {
 			return err
 		}
 		asked = true
@@ -447,8 +365,8 @@ func (a *app) login(ctx context.Context, cfg *config, name, reason string, env [
 // vaultLogin runs `vault login` with the terminal: vault asks for the
 // password or opens the browser. A terminal hands lines over one at a time,
 // so the answers read before left nothing buffered.
-func (a *app) vaultLogin(env, args []string, in io.Reader, out io.Writer) error {
-	bin, err := lookPath(a.vaultBin(), env)
+func (r *Runner) vaultLogin(env, args []string, in io.Reader, out io.Writer) error {
+	bin, err := environ.LookPath(r.VaultBin, env)
 	if err != nil {
 		return err
 	}
@@ -490,7 +408,7 @@ func askLogin(ans *answers, out io.Writer, user string) ([]string, error) {
 		if err != nil {
 			return nil, err
 		}
-		return loginArgs(line)
+		return config.LoginArgs(line)
 	case "token":
 		return []string{"-method=token"}, nil
 	}
@@ -518,16 +436,16 @@ func askLogin(ans *answers, out io.Writer, user string) ([]string, error) {
 			args = append(args, "role="+role)
 		}
 	}
-	return normalizeLoginArgs(args)
+	return config.NormalizeLoginArgs(args)
 }
 
-// rememberedLoginPath keeps the login answers for context name: not secrets.
-func (a *app) rememberedLoginPath(name string) string {
-	return filepath.Join(a.stateDir, "login", name+".json")
+// RememberedPath keeps the login answers for context name: not secrets.
+func (r *Runner) RememberedPath(name string) string {
+	return filepath.Join(r.StateDir, "login", name+".json")
 }
 
-func (a *app) rememberedLogin(name string) []string {
-	b, err := os.ReadFile(a.rememberedLoginPath(name))
+func (r *Runner) Remembered(name string) []string {
+	b, err := os.ReadFile(r.RememberedPath(name))
 	if err != nil {
 		return nil
 	}
@@ -535,35 +453,35 @@ func (a *app) rememberedLogin(name string) []string {
 	if json.Unmarshal(b, &args) != nil || len(args) == 0 {
 		return nil
 	}
-	args, err = normalizeLoginArgs(args)
+	args, err = config.NormalizeLoginArgs(args)
 	if err != nil {
 		return nil
 	}
 	return args
 }
 
-// loginFor is the login method of context name: from the config, else the
+// For is the login method of context name: from the config, else the
 // remembered answers; nil when there is neither.
-func (a *app) loginFor(cfg *config, name string) []string {
-	if args := cfg.login(name); args != nil {
+func (r *Runner) For(cfg *config.Config, name string) []string {
+	if args := cfg.Login(name); args != nil {
 		return args
 	}
-	return a.rememberedLogin(name)
+	return r.Remembered(name)
 }
 
-func (a *app) rememberLogin(name string, args []string) error {
+func (r *Runner) Remember(name string, args []string) error {
 	b, err := json.Marshal(args)
 	if err != nil {
 		return err
 	}
-	return writeFileAtomic(a.rememberedLoginPath(name), b, 0o600)
+	return atomicfile.Write(r.RememberedPath(name), b, 0o600)
 }
 
 // loginExec runs login under the UI as a tea.ExecCommand, so the UI hands the
 // terminal over for the questions and vault's own prompts.
 type loginExec struct {
-	a    *app
-	cfg  *config
+	r    *Runner
+	cfg  *config.Config
 	name string
 	in   io.Reader
 	out  io.Writer
@@ -575,11 +493,11 @@ func (l *loginExec) SetStderr(io.Writer)   {}
 
 // Run waits for Enter after a failure, so vault's message is read before the UI covers it.
 func (l *loginExec) Run() error {
-	ctx, stop := interruptible()
+	ctx, stop := Interruptible()
 	defer stop()
-	env, err := l.a.helperEnv(l.cfg, l.name)
+	env, err := l.r.helperEnv(l.cfg, l.name)
 	if err == nil {
-		err = l.a.login(ctx, l.cfg, l.name, "login requested", env, l.in, l.out)
+		err = l.r.login(ctx, l.cfg, l.name, "login requested", env, l.in, l.out)
 	}
 	if err != nil && !errors.Is(err, errCancelled) {
 		fmt.Fprintf(l.out, "  %s login failed: %v\n", l.name, err)
@@ -588,4 +506,9 @@ func (l *loginExec) Run() error {
 		_, _ = ans.ask(l.out, "press Enter to return to vctx", "")
 	}
 	return err
+}
+
+// Exec returns the login for context name as a tea.ExecCommand, for the UI.
+func (r *Runner) Exec(cfg *config.Config, name string) tea.ExecCommand {
+	return &loginExec{r: r, cfg: cfg, name: name}
 }

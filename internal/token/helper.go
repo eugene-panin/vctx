@@ -1,4 +1,4 @@
-package main
+package token
 
 import (
 	"crypto/sha256"
@@ -6,15 +6,17 @@ import (
 	"fmt"
 	"io"
 	"strings"
+
+	"github.com/eugene-panin/vctx/internal/config"
+	"github.com/eugene-panin/vctx/internal/environ"
 )
 
-const defaultVaultAddr = "https://127.0.0.1:8200"
-
-func isHelperOp(s string) bool {
+// IsHelperOp reports whether s is a token helper operation vault calls vctx with.
+func IsHelperOp(s string) bool {
 	return s == "get" || s == "store" || s == "erase"
 }
 
-// tokenKey picks the token for the calling vault process: by context when
+// Key picks the token for the vault process running with env: by context when
 // vault was started through vctx, otherwise by address and namespace. The "_"
 // prefix cannot start a context name, so the two kinds of keys never collide.
 //
@@ -22,47 +24,45 @@ func isHelperOp(s string) bool {
 // hand points vault away from the context; its token then goes under the
 // address key, so it neither replaces nor erases the context's own. Shells set
 // up by a vctx without VCTX_CONTEXT_ADDR always use the context name.
-func (a *app) tokenKey() string {
-	name, ctxAddr := a.getenv(envContext), a.getenv(envContextAddr)
+func Key(env []string) string {
+	get := func(k string) string { return environ.Value(env, k) }
+	name, ctxAddr := get(environ.Context), get(environ.ContextAddr)
 	ownContext := ctxAddr == "" ||
-		ctxAddr == a.callerAddr() && a.getenv(envContextNS) == a.getenv("VAULT_NAMESPACE")
-	if nameRe.MatchString(name) && ownContext {
+		ctxAddr == CallerAddr(env) && get(environ.ContextNS) == get("VAULT_NAMESPACE")
+	if config.ValidName(name) && ownContext {
 		return name
 	}
-	sum := sha256.Sum256([]byte(a.callerAddr() + "\x00" + a.getenv("VAULT_NAMESPACE")))
+	sum := sha256.Sum256([]byte(CallerAddr(env) + "\x00" + get("VAULT_NAMESPACE")))
 	return "_addr/" + hex.EncodeToString(sum[:12])
 }
 
-// callerAddr is the address the calling vault process talks to.
-func (a *app) callerAddr() string {
-	addr, _ := addrFrom(a.getenv)
-	return normalizeAddr(addr)
+// CallerAddr is the address the vault process running with env talks to.
+func CallerAddr(env []string) string {
+	addr, _ := config.AddrFrom(func(k string) string { return environ.Value(env, k) })
+	return config.NormalizeAddr(addr)
 }
 
-// tokenHelper implements the Vault token helper protocol:
+// Helper runs one operation of the Vault token helper protocol for the vault
+// process running with env:
 // https://developer.hashicorp.com/vault/docs/commands/token-helper
 //
 // Tokens are stored with the address they were issued for and never handed to
 // vault talking to another address. Such a token, or one stored without an
 // address, is reported as missing rather than as an error: `vault login` asks
 // for the current token first and would fail, leaving no way to replace it.
-func (a *app) tokenHelper(op string) error {
-	store, err := a.tokens()
-	if err != nil {
-		return err
-	}
-	key := a.tokenKey()
+func Helper(op string, env []string, s Store, in io.Reader, out io.Writer) error {
+	key := Key(env)
 	switch op {
 	case "get":
-		token, addr, ok, err := store.get(key)
-		if err != nil || !ok || addr != a.callerAddr() {
+		token, addr, ok, err := s.Get(key)
+		if err != nil || !ok || addr != CallerAddr(env) {
 			return err
 		}
-		_, err = io.WriteString(a.stdout, token)
+		_, err = io.WriteString(out, token)
 		return err
 	case "store":
 		const maxToken = 64 << 10
-		b, err := io.ReadAll(io.LimitReader(a.stdin, maxToken+1))
+		b, err := io.ReadAll(io.LimitReader(in, maxToken+1))
 		if err != nil {
 			return fmt.Errorf("read token: %w", err)
 		}
@@ -71,11 +71,11 @@ func (a *app) tokenHelper(op string) error {
 		}
 		token := strings.TrimSpace(string(b))
 		if token == "" {
-			return store.del(key)
+			return s.Del(key)
 		}
-		return store.set(key, token, a.callerAddr())
+		return s.Set(key, token, CallerAddr(env))
 	case "erase":
-		return store.del(key)
+		return s.Del(key)
 	}
 	return fmt.Errorf("unknown token helper operation %q", op)
 }

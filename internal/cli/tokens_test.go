@@ -1,4 +1,4 @@
-package main
+package cli
 
 import (
 	"errors"
@@ -7,6 +7,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/eugene-panin/vctx/internal/atomicfile"
+	"github.com/eugene-panin/vctx/internal/config"
+	"github.com/eugene-panin/vctx/internal/token"
 	"github.com/zalando/go-keyring"
 )
 
@@ -46,7 +49,7 @@ func (f *fakeKeyring) Delete(service, user string) error {
 	return nil
 }
 
-func loadTestConfig(t *testing.T, a *app) *config {
+func loadTestConfig(t *testing.T, a *app) *config.Config {
 	t.Helper()
 	cfg, err := a.loadConfig()
 	if err != nil {
@@ -63,7 +66,7 @@ func TestKeychainStore(t *testing.T) {
 	cfg := loadTestConfig(t, a)
 
 	// A token file from an earlier version is read as is, without writing anything.
-	if err := writeFileAtomic(a.tokenPath("dev"), []byte("http://127.0.0.1:8201\nold-token\n"), 0o600); err != nil {
+	if err := atomicfile.Write(a.tokenPath("dev"), []byte("http://127.0.0.1:8201\nold-token\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := a.run([]string{"get"}); err != nil {
@@ -72,7 +75,7 @@ func TestKeychainStore(t *testing.T) {
 	if out.String() != "old-token" || len(kr.m) != 0 {
 		t.Errorf("legacy read: token %q, keychain %v", out, kr)
 	}
-	if got, err := a.tokenStatus(cfg, []string{"dev", "prod"}); err != nil || got["dev"] != tokenOK || got["prod"] != tokenNone {
+	if got, err := a.tokenStatus(cfg, []string{"dev", "prod"}); err != nil || got["dev"] != token.OK || got["prod"] != token.None {
 		t.Errorf("token status = %v, %v", got, err)
 	}
 
@@ -103,11 +106,11 @@ func TestTokenStatusSeesAddressChange(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := loadTestConfig(t, a)
-	if got, _ := a.tokenStatus(cfg, []string{"dev"}); got["dev"] != tokenOK {
+	if got, _ := a.tokenStatus(cfg, []string{"dev"}); got["dev"] != token.OK {
 		t.Errorf("before: %v", got)
 	}
 	cfg.Contexts["dev"]["VAULT_ADDR"] = "http://localhost:8201"
-	if got, _ := a.tokenStatus(cfg, []string{"dev"}); got["dev"] != tokenStale {
+	if got, _ := a.tokenStatus(cfg, []string{"dev"}); got["dev"] != token.Stale {
 		t.Errorf("after the address changed: %v", got)
 	}
 }
@@ -139,10 +142,10 @@ func TestStatusDoesNotMigrate(t *testing.T) {
 	a, _, _ := newTestApp(t, "VCTX_TOKEN_STORE=keychain")
 	kr := newFakeKeyring()
 	a.keyring = kr
-	if err := writeFileAtomic(a.tokenPath("dev"), []byte("t"), 0o600); err != nil {
+	if err := atomicfile.Write(a.tokenPath("dev"), []byte("t"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := a.tokenStatus(loadTestConfig(t, a), []string{"dev"}); err != nil || got["dev"] == tokenNone {
+	if got, err := a.tokenStatus(loadTestConfig(t, a), []string{"dev"}); err != nil || got["dev"] == token.None {
 		t.Fatalf("status = %v, %v", got, err)
 	}
 	if len(kr.m) != 0 {
@@ -172,7 +175,7 @@ func TestKeychainStatusReadsNoSecret(t *testing.T) {
 		t.Fatal(err)
 	}
 	kr.gets = 0
-	if got, err := a.tokenStatus(loadTestConfig(t, a), []string{"dev"}); err != nil || got["dev"] != tokenOK {
+	if got, err := a.tokenStatus(loadTestConfig(t, a), []string{"dev"}); err != nil || got["dev"] != token.OK {
 		t.Fatalf("status = %v, %v", got, err)
 	}
 	if kr.gets != 0 {
@@ -200,7 +203,7 @@ func TestStoresKeepTheirOwnAddresses(t *testing.T) {
 	a.environ = withEnv(base, "VCTX_TOKEN_STORE=keychain")
 	state, _ := a.tokenStatus(loadTestConfig(t, a), []string{"dev"})
 	got := run("get", "", "VCTX_TOKEN_STORE=keychain", "VAULT_ADDR=http://127.0.0.1:8201")
-	if state["dev"] != tokenOK || got != "kc-token" {
+	if state["dev"] != token.OK || got != "kc-token" {
 		t.Errorf("keychain: status %v, get %q", state["dev"], got)
 	}
 }
@@ -224,7 +227,7 @@ func TestFailedStoreKeepsAddressRecord(t *testing.T) {
 		t.Fatal("store succeeded against a refusing keychain")
 	}
 	a.keyring = kr
-	if got, _ := a.tokenStatus(loadTestConfig(t, a), []string{"dev"}); got["dev"] != tokenOK {
+	if got, _ := a.tokenStatus(loadTestConfig(t, a), []string{"dev"}); got["dev"] != token.OK {
 		t.Errorf("status after a failed store = %v, want the old token still ok", got["dev"])
 	}
 }
@@ -238,7 +241,7 @@ func TestKeychainItemWithoutAddressRecord(t *testing.T) {
 	kr.m["vctx/dev"] = "http://127.0.0.1:8201\ntok\n"
 	kr.m["vctx/prod"] = "http://elsewhere\ntok\n"
 	got, err := a.tokenStatus(loadTestConfig(t, a), []string{"dev", "prod"})
-	if err != nil || got["dev"] != tokenOK || got["prod"] != tokenStale {
+	if err != nil || got["dev"] != token.OK || got["prod"] != token.Stale {
 		t.Errorf("status = %v, %v", got, err)
 	}
 	if entries, _ := os.ReadDir(filepath.Join(a.stateDir, "keychain-addrs")); len(entries) != 0 {
@@ -249,7 +252,7 @@ func TestKeychainItemWithoutAddressRecord(t *testing.T) {
 func TestOldAddressRecordsRemoved(t *testing.T) {
 	a, out, _ := newTestApp(t, "VCTX_TOKEN_STORE=keychain")
 	old := filepath.Join(a.stateDir, "addrs", "dev")
-	if err := writeFileAtomic(old, []byte("http://stale\n"), 0o600); err != nil {
+	if err := atomicfile.Write(old, []byte("http://stale\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	helper := helperRunner(t, a, out)
@@ -257,7 +260,7 @@ func TestOldAddressRecordsRemoved(t *testing.T) {
 	if _, err := os.Stat(old); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("old record left after store: %v", err)
 	}
-	if err := writeFileAtomic(old, []byte("http://stale\n"), 0o600); err != nil {
+	if err := atomicfile.Write(old, []byte("http://stale\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	helper("erase", "", "VCTX_CONTEXT=dev", "VAULT_ADDR=http://127.0.0.1:8201")

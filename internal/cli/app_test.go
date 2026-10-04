@@ -1,4 +1,4 @@
-package main
+package cli
 
 import (
 	"bytes"
@@ -10,6 +10,11 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/eugene-panin/vctx/internal/config"
+	"github.com/eugene-panin/vctx/internal/environ"
+	"github.com/eugene-panin/vctx/internal/token"
+	"github.com/eugene-panin/vctx/internal/vaulttest"
 )
 
 const testConfig = `
@@ -102,7 +107,7 @@ func TestLoadConfigErrors(t *testing.T) {
 			if err := os.WriteFile(p, []byte(tc.yaml), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			_, err := loadConfig(p)
+			_, err := config.Load(p)
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("err = %v, want %q", err, tc.want)
 			}
@@ -196,7 +201,7 @@ func TestEnvShell(t *testing.T) {
 }
 
 func TestShellQuote(t *testing.T) {
-	if got, want := shellQuote(`it's $HOME`), `'it'\''s $HOME'`; got != want {
+	if got, want := environ.ShellQuote(`it's $HOME`), `'it'\''s $HOME'`; got != want {
 		t.Errorf("got %s, want %s", got, want)
 	}
 }
@@ -248,7 +253,7 @@ func TestVaultConfigRejectsUnsafePath(t *testing.T) {
 	for _, self := range []string{"/Users/me/My Tools/vctx", "/opt/{a,b}/vctx", "/tmp/$(id)/vctx"} {
 		a, _, _ := newTestApp(t)
 		a.self = self
-		writeContexts(t, a, map[string]string{"dev": serve(t, vaultHandler(200, activeBody))})
+		writeContexts(t, a, map[string]string{"dev": vaulttest.Serve(t, vaulttest.Handler(200, vaulttest.ActiveBody))})
 		if err := a.run([]string{"dev", "status"}); err == nil || !strings.Contains(err.Error(), "token helper") {
 			t.Errorf("%s accepted as token helper path: %v", self, err)
 		}
@@ -387,7 +392,7 @@ func TestAddressAndContextTokensApart(t *testing.T) {
 
 func TestCallerAddrPrefersAgent(t *testing.T) {
 	a, _, _ := newTestApp(t, "VAULT_ADDR=https://vault:8200/", "VAULT_AGENT_ADDR=http://127.0.0.1:8100/")
-	if got := a.callerAddr(); got != "http://127.0.0.1:8100" {
+	if got := token.CallerAddr(a.environ); got != "http://127.0.0.1:8100" {
 		t.Errorf("callerAddr = %q", got)
 	}
 }
@@ -430,17 +435,17 @@ func TestLookPathUsesContextPath(t *testing.T) {
 	if err := os.WriteFile(bin, []byte("#!/bin/sh\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := lookPath("vault", []string{"PATH=relative:" + dir}); err != nil || got != bin {
+	if got, err := environ.LookPath("vault", []string{"PATH=relative:" + dir}); err != nil || got != bin {
 		t.Errorf("got %q, %v", got, err)
 	}
-	if _, err := lookPath("vault", []string{"PATH=relative"}); err == nil {
+	if _, err := environ.LookPath("vault", []string{"PATH=relative"}); err == nil {
 		t.Error("relative PATH entry used")
 	}
 }
 
 func TestCheckPrivateOwner(t *testing.T) {
 	fi := fakeInfo{mode: 0o600, sys: &syscall.Stat_t{Uid: uint32(os.Getuid() + 1)}}
-	if err := checkPrivate("cfg", fi); err == nil || !strings.Contains(err.Error(), "another user") {
+	if err := config.CheckPrivate("cfg", fi); err == nil || !strings.Contains(err.Error(), "another user") {
 		t.Errorf("err = %v", err)
 	}
 }
@@ -515,38 +520,38 @@ func TestConfigSizeLimit(t *testing.T) {
 }
 
 func TestLookupEnvFirstWins(t *testing.T) {
-	if got := envValue([]string{"A=1", "A=2"}, "A"); got != "1" {
+	if got := environ.Value([]string{"A=1", "A=2"}, "A"); got != "1" {
 		t.Errorf("got %q", got)
 	}
 }
 
 func TestSwitchRestoresOwnValues(t *testing.T) {
-	cfg := &config{Contexts: map[string]map[string]string{
+	cfg := &config.Config{Contexts: map[string]map[string]string{
 		"a": {"VAULT_ADDR": "https://a", "PATH": "/opt/a/bin:/usr/bin", "HTTPS_PROXY": "http://proxy-a"},
 		"b": {"VAULT_ADDR": "https://b"},
 	}}
 	a, _, _ := newTestApp(t)
 	user := []string{"PATH=/usr/bin", "HTTPS_PROXY=http://mine", "HOME=/home/u"}
-	ctx := func(environ []string, name string) []string {
+	ctx := func(osEnv []string, name string) []string {
 		t.Helper()
-		a.environ = environ
-		vars, err := a.contextVars(cfg, name)
+		a.environ = osEnv
+		vars, err := environ.ContextVars(cfg, name, a.home)
 		if err != nil {
 			t.Fatal(err)
 		}
-		return applyEnv(environ, vars)
+		return environ.Apply(osEnv, vars)
 	}
 
 	inA := ctx(user, "a")
-	if envValue(inA, "PATH") != "/opt/a/bin:/usr/bin" || envValue(inA, "VCTX_SAVED_PATH") != "/usr/bin" {
+	if environ.Value(inA, "PATH") != "/opt/a/bin:/usr/bin" || environ.Value(inA, "VCTX_SAVED_PATH") != "/usr/bin" {
 		t.Errorf("in a: %q", inA)
 	}
 	// Re-applying a must not save a's own value as the user's.
-	if again := ctx(inA, "a"); envValue(again, "VCTX_SAVED_PATH") != "/usr/bin" {
+	if again := ctx(inA, "a"); environ.Value(again, "VCTX_SAVED_PATH") != "/usr/bin" {
 		t.Errorf("a again: %q", again)
 	}
 	inB := ctx(inA, "b")
-	if envValue(inB, "PATH") != "/usr/bin" || envValue(inB, "HTTPS_PROXY") != "http://mine" {
+	if environ.Value(inB, "PATH") != "/usr/bin" || environ.Value(inB, "HTTPS_PROXY") != "http://mine" {
 		t.Errorf("in b: %q", inB)
 	}
 	for _, kv := range inB {
@@ -556,7 +561,7 @@ func TestSwitchRestoresOwnValues(t *testing.T) {
 	}
 
 	var sh bytes.Buffer
-	writeShellEnv(&sh, inA, nil)
+	environ.WritePOSIX(&sh, inA, nil)
 	if !strings.Contains(sh.String(), "export PATH='/usr/bin'\n") || strings.Contains(sh.String(), "unset PATH") {
 		t.Errorf("--clear from a:\n%s", sh.String())
 	}
@@ -688,7 +693,7 @@ func TestContextBindingEndToEnd(t *testing.T) {
 	}
 	a.environ = call.env // what the token helper sees when vault runs it
 	helperRunner(t, a, out)("store", "tok")
-	if got, err := a.tokenStatus(loadTestConfig(t, a), []string{"dev"}); err != nil || got["dev"] != tokenOK {
+	if got, err := a.tokenStatus(loadTestConfig(t, a), []string{"dev"}); err != nil || got["dev"] != token.OK {
 		t.Errorf("status after login = %v, %v", got, err)
 	}
 

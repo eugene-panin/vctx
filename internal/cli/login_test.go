@@ -1,4 +1,4 @@
-package main
+package cli
 
 import (
 	"bytes"
@@ -11,27 +11,8 @@ import (
 	"testing"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
+	"github.com/eugene-panin/vctx/internal/vaulttest"
 )
-
-func TestLoginArgs(t *testing.T) {
-	for in, want := range map[string][]string{
-		"":                                      nil,
-		"-method=userpass username=me":          {"-method=userpass", "username=me"},
-		`-method=oidc role="dev team"`:          {"-method=oidc", "role=dev team"},
-		"-method=ldap   -path=corp  username=x": {"-method=ldap", "-path=corp", "username=x"},
-	} {
-		got, err := loginArgs(in)
-		if err != nil || !slices.Equal(got, want) {
-			t.Errorf("%q: %q, %v", in, got, err)
-		}
-	}
-	for _, bad := range []string{"hvs.CAESIJ", "-method=userpass password=x", "token=hvs.x", "-address=http://evil", `role="open`} {
-		if _, err := loginArgs(bad); err == nil {
-			t.Errorf("%q accepted", bad)
-		}
-	}
-}
 
 func TestLoginInConfig(t *testing.T) {
 	a, _, _ := newTestApp(t)
@@ -40,13 +21,13 @@ func TestLoginInConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	c := loadTestConfig(t, a)
-	if got := c.login("dev"); !slices.Equal(got, []string{"-method=oidc"}) {
+	if got := c.Login("dev"); !slices.Equal(got, []string{"-method=oidc"}) {
 		t.Errorf("dev inherits defaults: %q", got)
 	}
-	if got := c.login("ops"); !slices.Equal(got, []string{"-method=userpass", "username=ops"}) {
+	if got := c.Login("ops"); !slices.Equal(got, []string{"-method=userpass", "username=ops"}) {
 		t.Errorf("ops: %q", got)
 	}
-	vars, _ := c.vars("ops", a.home)
+	vars, _ := c.Vars("ops", a.home)
 	if _, ok := vars["login"]; ok {
 		t.Error("login leaked into the environment")
 	}
@@ -92,8 +73,8 @@ if [ "$1 $2" = "print token" ]; then echo "` + printed + `"; fi
 }
 
 func TestEnsureLogin(t *testing.T) {
-	devAddr := serve(t, vaultHandler(200, activeBody))
-	cfg := "contexts:\n  dev:\n    VAULT_ADDR: " + devAddr + "\n    login: -method=userpass username=me\n  bare:\n    VAULT_ADDR: " + serve(t, vaultHandler(200, activeBody)) + "\n"
+	devAddr := vaulttest.Serve(t, vaulttest.Handler(200, vaulttest.ActiveBody))
+	cfg := "contexts:\n  dev:\n    VAULT_ADDR: " + devAddr + "\n    login: -method=userpass username=me\n  bare:\n    VAULT_ADDR: " + vaulttest.Serve(t, vaulttest.Handler(200, vaulttest.ActiveBody)) + "\n"
 	tests := []struct {
 		name, context, lookup string
 		stored, tty           bool
@@ -139,7 +120,7 @@ func TestEnsureLogin(t *testing.T) {
 			if tc.wantInErr != "" && !strings.Contains(stderr.String(), tc.wantInErr) {
 				t.Errorf("stderr %q, want %q", stderr.String(), tc.wantInErr)
 			}
-			_, err := os.Stat(a.rememberedLoginPath(tc.context))
+			_, err := os.Stat(a.loginRunner().RememberedPath(tc.context))
 			if remembered := err == nil; remembered != tc.wantRemembered {
 				t.Errorf("remembered = %v, want %v", remembered, tc.wantRemembered)
 			}
@@ -147,27 +128,23 @@ func TestEnsureLogin(t *testing.T) {
 	}
 }
 
-func TestDetailShowsLogin(t *testing.T) {
+func TestBackendLoginMethodFromConfig(t *testing.T) {
 	a, _, _ := newTestApp(t)
 	cfg := "contexts:\n  dev:\n    VAULT_ADDR: http://v\n    login: -method=oidc -path=sso\n"
 	if err := os.WriteFile(a.configPath, []byte(cfg), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	m, err := newModel(a, loadTestConfig(t, a))
-	if err != nil {
-		t.Fatal(err)
-	}
-	m.Update(tea.WindowSizeMsg{Width: 150, Height: 30})
-	if view := m.View(); !strings.Contains(view, "-method=oidc -path=sso") {
-		t.Errorf("details:\n%s", view)
+	b := uiBackend{a, loadTestConfig(t, a)}
+	if got := b.LoginMethod("dev"); !slices.Equal(got, []string{"-method=oidc", "-path=sso"}) {
+		t.Errorf("login method = %q", got)
 	}
 }
 
 func TestRememberedLoginUsedNextTime(t *testing.T) {
 	bin, log := fakeVault(t, "denied")
 	a, _, _ := newTestApp(t, "VCTX_VAULT_BIN="+bin)
-	writeContexts(t, a, map[string]string{"dev": serve(t, vaultHandler(200, activeBody))})
-	if err := a.rememberLogin("dev", []string{"-method=ldap", "username=me"}); err != nil {
+	writeContexts(t, a, map[string]string{"dev": vaulttest.Serve(t, vaulttest.Handler(200, vaulttest.ActiveBody))})
+	if err := a.loginRunner().Remember("dev", []string{"-method=ldap", "username=me"}); err != nil {
 		t.Fatal(err)
 	}
 	cfg := loadTestConfig(t, a)
@@ -187,7 +164,7 @@ func TestLoginFromUI(t *testing.T) {
 	bin, log := fakeVault(t, "ok")
 	a, _, _ := newTestApp(t, "VCTX_VAULT_BIN="+bin)
 	var out bytes.Buffer
-	l := &loginExec{a: a, cfg: loadTestConfig(t, a), name: "dev"}
+	l := a.loginRunner().Exec(loadTestConfig(t, a), "dev")
 	l.SetStdin(strings.NewReader("4\n"))
 	l.SetStdout(&out)
 	l.SetStderr(&out)
@@ -202,7 +179,7 @@ func TestLoginFromUI(t *testing.T) {
 func TestNoLoginAgainstUnusableServer(t *testing.T) {
 	bin, log := fakeVault(t, "ok")
 	sealed := `{"initialized":true,"sealed":true,"version":"1.20.4"}`
-	for name, addr := range map[string]string{"sealed": serve(t, vaultHandler(503, sealed)), "down": closedURL(t)} {
+	for name, addr := range map[string]string{"sealed": vaulttest.Serve(t, vaulttest.Handler(503, sealed)), "down": vaulttest.ClosedURL(t)} {
 		a, _, _ := newTestApp(t, "VCTX_VAULT_BIN="+bin)
 		writeContexts(t, a, map[string]string{"x": addr})
 		var stderr bytes.Buffer
@@ -220,7 +197,7 @@ func TestNoLoginAgainstUnusableServer(t *testing.T) {
 func TestExternalTokenNeverLogsIn(t *testing.T) {
 	bin, log := fakeVault(t, "denied")
 	a, _, _ := newTestApp(t, "VCTX_VAULT_BIN="+bin)
-	addr := serve(t, vaultHandler(200, activeBody))
+	addr := vaulttest.Serve(t, vaulttest.Handler(200, vaulttest.ActiveBody))
 	cfg := "contexts:\n  x:\n    VAULT_ADDR: " + addr + "\n    VAULT_TOKEN: hvs.fromconfig\n    login: -method=userpass username=me\n"
 	if err := os.WriteFile(a.configPath, []byte(cfg), 0o600); err != nil {
 		t.Fatal(err)
@@ -236,45 +213,10 @@ func TestExternalTokenNeverLogsIn(t *testing.T) {
 	}
 }
 
-func TestLoginArgsWhitelist(t *testing.T) {
-	for in, want := range map[string][]string{
-		"-method oidc -path sso":           {"-method=oidc", "-path=sso"},
-		"-method=userpass\nusername=me":    {"-method=userpass", "username=me"},
-		"--method=ldap username=me role=x": {"-method=ldap", "username=me", "role=x"},
-		"-method=kerberos keytab_path=/etc/krb5.keytab krb5conf_path=/etc/krb5.conf": {
-			"-method=kerberos", "keytab_path=/etc/krb5.keytab", "krb5conf_path=/etc/krb5.conf",
-		},
-	} {
-		got, err := loginArgs(in)
-		if err != nil || !slices.Equal(got, want) {
-			t.Errorf("%q: %q, %v", in, got, err)
-		}
-	}
-	for _, bad := range []string{
-		"-no-print=false", "-header=X-Vault-Token=hvs.x", "-mfa=123", "-output-curl-string", "-namespace=other",
-		"aws_secret_access_key=x", "security_token=x", "secret_key=x", "username=me -path=sso", "-method",
-	} {
-		if _, err := loginArgs(bad); err == nil {
-			t.Errorf("%q accepted", bad)
-		}
-	}
-}
-
-func TestVaultError(t *testing.T) {
-	out := "Error looking up token: Error making API request.\n\nURL: GET http://v/v1/auth/token/lookup-self\nCode: 503. Errors:\n\n* Vault is sealed\n"
-	if got := vaultError(out); got != "Code: 503. Vault is sealed" {
-		t.Errorf("got %q", got)
-	}
-	nested := "Code: 403. Errors:\n\n* 2 errors occurred:\n\t* permission denied\n\t* invalid token\n"
-	if got := vaultError(nested); got != "Code: 403. permission denied" {
-		t.Errorf("nested: %q", got)
-	}
-}
-
 func TestCancelAtPrompt(t *testing.T) {
 	bin, log := fakeVault(t, "ok")
 	a, _, _ := newTestApp(t, "VCTX_VAULT_BIN="+bin)
-	writeContexts(t, a, map[string]string{"x": serve(t, vaultHandler(200, activeBody))})
+	writeContexts(t, a, map[string]string{"x": vaulttest.Serve(t, vaulttest.Handler(200, vaulttest.ActiveBody))})
 	r, w, err := os.Pipe() // a real file, as the terminal is: Ctrl-C must interrupt the read
 	if err != nil {
 		t.Fatal(err)
@@ -311,7 +253,7 @@ func TestCancelAtPrompt(t *testing.T) {
 }
 
 func TestOwnTokenHelperContext(t *testing.T) {
-	addr := serve(t, vaultHandler(200, activeBody))
+	addr := vaulttest.Serve(t, vaulttest.Handler(200, vaulttest.ActiveBody))
 	cfg := "contexts:\n  x:\n    VAULT_ADDR: " + addr + "\n    VAULT_CONFIG_PATH: /etc/vault-cli.hcl\n    login: -method=userpass username=me\n"
 	for _, tc := range []struct {
 		name, lookup, printed string
@@ -340,7 +282,7 @@ func TestOwnTokenHelperContext(t *testing.T) {
 func TestAgentContextNeverLogsIn(t *testing.T) {
 	bin, log := fakeVault(t, "denied")
 	a, _, _ := newTestApp(t, "VCTX_VAULT_BIN="+bin)
-	addr := serve(t, vaultHandler(200, activeBody))
+	addr := vaulttest.Serve(t, vaulttest.Handler(200, vaulttest.ActiveBody))
 	cfg := "contexts:\n  x:\n    VAULT_AGENT_ADDR: " + addr + "\n    login: -method=userpass username=me\n"
 	if err := os.WriteFile(a.configPath, []byte(cfg), 0o600); err != nil {
 		t.Fatal(err)
@@ -355,8 +297,8 @@ func TestAgentContextNeverLogsIn(t *testing.T) {
 func TestFailedLoginOffersAnotherMethod(t *testing.T) {
 	bin, log := fakeVault(t, "loginfails")
 	a, _, _ := newTestApp(t, "VCTX_VAULT_BIN="+bin)
-	writeContexts(t, a, map[string]string{"x": serve(t, vaultHandler(200, activeBody))})
-	if err := a.rememberLogin("x", []string{"-method=ldap", "username=me"}); err != nil {
+	writeContexts(t, a, map[string]string{"x": vaulttest.Serve(t, vaulttest.Handler(200, vaulttest.ActiveBody))})
+	if err := a.loginRunner().Remember("x", []string{"-method=ldap", "username=me"}); err != nil {
 		t.Fatal(err)
 	}
 	var stderr bytes.Buffer
@@ -367,7 +309,7 @@ func TestFailedLoginOffersAnotherMethod(t *testing.T) {
 	if !strings.Contains(string(calls), "-method=ldap") || !strings.Contains(string(calls), "-method=userpass") {
 		t.Errorf("calls:\n%s\nstderr:\n%s", calls, stderr.String())
 	}
-	if got := a.rememberedLogin("x"); !slices.Equal(got, []string{"-method=ldap", "username=me"}) {
+	if got := a.loginRunner().Remembered("x"); !slices.Equal(got, []string{"-method=ldap", "username=me"}) {
 		t.Errorf("remembered after failures = %q, want unchanged", got)
 	}
 }
@@ -375,9 +317,9 @@ func TestFailedLoginOffersAnotherMethod(t *testing.T) {
 func TestLoginFromUIWaitsAfterFailure(t *testing.T) {
 	bin, _ := fakeVault(t, "loginfails")
 	a, _, _ := newTestApp(t, "VCTX_VAULT_BIN="+bin)
-	writeContexts(t, a, map[string]string{"x": serve(t, vaultHandler(200, activeBody))})
+	writeContexts(t, a, map[string]string{"x": vaulttest.Serve(t, vaulttest.Handler(200, vaulttest.ActiveBody))})
 	var out bytes.Buffer
-	l := &loginExec{a: a, cfg: loadTestConfig(t, a), name: "x"}
+	l := a.loginRunner().Exec(loadTestConfig(t, a), "x")
 	l.SetStdin(strings.NewReader("4\nn\n\n")) // token, no other method, Enter
 	l.SetStdout(&out)
 	if err := l.Run(); err == nil {

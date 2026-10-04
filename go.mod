@@ -1,4 +1,4 @@
-module vctx
+module github.com/eugene-panin/vctx
 
 go 1.26
 
