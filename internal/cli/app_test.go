@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"go/ast"
 	"go/parser"
@@ -390,7 +391,7 @@ func TestAddressFlagWithCustomVaultBin(t *testing.T) {
 func TestUsageMessages(t *testing.T) {
 	a, _, _ := newTestApp(t)
 	var uerr usageError
-	for _, args := range [][]string{{"check", "-h"}, {"ls", "x"}, {"current", "x"}} {
+	for _, args := range [][]string{{"check", "-x"}, {"ls", "x"}, {"current", "x"}} {
 		if err := a.run(args); !errors.As(err, &uerr) {
 			t.Errorf("%q: err = %v, want a usage error", args, err)
 		}
@@ -432,13 +433,129 @@ func TestUseHidesCredentials(t *testing.T) {
 	}
 }
 
-func TestFlagsAreUsageErrors(t *testing.T) {
-	a, _, _ := newTestApp(t)
-	var uerr usageError
-	for _, args := range [][]string{{"logout", "-h"}, {"use", "-h"}} {
-		if err := a.run(args); !errors.As(err, &uerr) {
-			t.Errorf("%q: err = %v, want a usage error", args, err)
+// -h anywhere on the line shows the command's help, even next to invalid arguments.
+func TestHelpWinsOverEverything(t *testing.T) {
+	for _, args := range [][]string{
+		{"check", "-h"}, {"check", "--bogus", "-h"}, {"use", "a", "b", "--help"}, {"logout", "-h"},
+		{"ls", "x", "-h"}, {"list", "-h"}, {"env", "--bogus", "-h"}, {"init", "-h"}, {"exec", "-h"},
+		{"current", "-h"}, {"version", "-h"}, {"help", "check"},
+	} {
+		a, out, call := newTestApp(t)
+		if err := a.run(args); err != nil {
+			t.Errorf("%q: %v", args, err)
+			continue
 		}
+		cmd := args[0]
+		if cmd == "help" {
+			cmd = args[1]
+		}
+		if cmd == "list" {
+			cmd = "ls"
+		}
+		if !strings.HasPrefix(out.String(), "usage: vctx "+cmd) || call.argv0 != "" {
+			t.Errorf("%q printed:\n%s", args, out)
+		}
+	}
+}
+
+func TestHelpAfterDashDashBelongsToCommand(t *testing.T) {
+	a, out, call := newTestApp(t)
+	if err := a.run([]string{"exec", "dev", "--", "sh", "-h"}); err != nil {
+		t.Fatal(err)
+	}
+	if out.Len() > 0 || !slices.Equal(call.argv, []string{"sh", "-h"}) {
+		t.Errorf("out %q, argv %q", out, call.argv)
+	}
+}
+
+func TestEveryCommandHasHelp(t *testing.T) {
+	for _, cmd := range commands {
+		if strings.HasPrefix(cmd, "-") || cmd == "help" || cmd == "list" || token.IsHelperOp(cmd) {
+			continue
+		}
+		if _, ok := commandHelp[cmd]; !ok {
+			t.Errorf("no help for %s", cmd)
+		}
+	}
+}
+
+func TestTypoSuggestion(t *testing.T) {
+	a, _, call := newTestApp(t)
+	for args, want := range map[string]string{"chek": `did you mean "check"`, "prd": `did you mean "prod"`, "lst": `did you mean "ls"`} {
+		err := a.run([]string{args})
+		var uerr usageError
+		if !errors.As(err, &uerr) || !strings.Contains(err.Error(), want) || call.argv0 != "" {
+			t.Errorf("%s: %v", args, err)
+		}
+	}
+	if err := a.run([]string{"zzzzzz"}); err == nil || strings.Contains(err.Error(), "did you mean") {
+		t.Errorf("far word: %v", err)
+	}
+}
+
+func TestLogoutSaysWhatItForgot(t *testing.T) {
+	a, out, _ := newTestApp(t)
+	var stderr bytes.Buffer
+	a.stderr = &stderr
+	helperRunner(t, a, out)("store", "tok", "VCTX_CONTEXT=dev")
+	a.environ = withEnv(a.environ, "VCTX_CONTEXT=")
+	for _, want := range []string{"forgot the token of dev\n", "no token of dev stored\n"} {
+		stderr.Reset()
+		if err := a.run([]string{"logout", "dev"}); err != nil {
+			t.Fatal(err)
+		}
+		if stderr.String() != want {
+			t.Errorf("stderr %q, want %q", stderr.String(), want)
+		}
+	}
+}
+
+func TestListJSON(t *testing.T) {
+	a, out, _ := newTestApp(t)
+	if err := a.run([]string{"use", "prod"}); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if err := a.run([]string{"ls", "--json"}); err != nil {
+		t.Fatal(err)
+	}
+	var got []lsEntry
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("%v:\n%s", err, out)
+	}
+	want := []lsEntry{
+		{Name: "dev", Address: "http://127.0.0.1:8201", Token: "none"},
+		{Name: "prod", Address: "https://vault.example.com", Namespace: "admin", Token: "none", Current: true},
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("got %+v", got)
+	}
+}
+
+func TestListHeaderOnlyOnTerminal(t *testing.T) {
+	a, out, _ := newTestApp(t)
+	if err := a.run([]string{"ls"}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out.String(), "CONTEXT") {
+		t.Errorf("header in piped output:\n%s", out)
+	}
+	out.Reset()
+	a.stdoutTTY = true
+	if err := a.run([]string{"ls"}); err != nil {
+		t.Fatal(err)
+	}
+	if first, _, _ := strings.Cut(out.String(), "\n"); !strings.Contains(first, "CONTEXT") {
+		t.Errorf("no header on a terminal:\n%s", out)
+	}
+}
+
+func TestInitWithoutShell(t *testing.T) {
+	a, _, _ := newTestApp(t, "SHELL=")
+	err := a.run([]string{"init"})
+	var uerr usageError
+	if !errors.As(err, &uerr) || !strings.Contains(err.Error(), "--shell") {
+		t.Errorf("err = %v", err)
 	}
 }
 

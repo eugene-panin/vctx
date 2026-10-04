@@ -40,6 +40,15 @@ The binary ends up in `$(go env GOPATH)/bin`, usually `~/go/bin`.
 vctx runs the `vault` binary it finds on `PATH` (or `$VCTX_VAULT_BIN`). It
 does not replace or bundle it.
 
+To uninstall, remove the binary (`brew uninstall vctx`, or delete it from
+`~/go/bin`), the `vctx init` line from your shell's rc file, and what vctx
+keeps:
+
+```bash
+rm -rf ~/.config/vctx ~/.local/state/vctx
+while security delete-generic-password -s vctx >/dev/null 2>&1; do :; done  # macOS Keychain tokens
+```
+
 ## Set up
 
 Describe your instances in `~/.config/vctx/config.yaml`:
@@ -97,7 +106,9 @@ vctx prod kv get secret/app          # vault kv get ... against prod
 vctx exec prod -- terraform plan     # any command with prod's variables
 ```
 
-`vctx help` lists all commands and settings.
+For scripts, `vctx ls --json` and `vctx check --json` print JSON.
+
+`vctx help` lists all commands and settings, `vctx <command> -h` explains one.
 
 ## How it works
 
@@ -140,6 +151,21 @@ eval "$(vctx env --clear)"  # undo
 ```
 
 `vctx env ... --shell fish` prints the same for fish.
+
+## Design notes
+
+vctx follows the [Command Line Interface Guidelines](https://clig.dev), with
+these deliberate exceptions:
+
+- `vctx <context> [vault args...]` treats any word that is not a command as a
+  context. That shortcut is the point of the tool; a context named like a
+  command is rejected when the config is loaded.
+- The command line is parsed by hand rather than with a parser library: after
+  a context name every argument, `-h` included, belongs to vault untouched.
+- `vctx logout` does not ask for confirmation: it only forgets a token, which
+  the next login brings back.
+- `vctx init` appends to your rc file without asking: that is all it is run
+  for. It says which file it changed, marks the line, and never adds it twice.
 
 ## License
 

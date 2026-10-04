@@ -2,6 +2,7 @@
 package cli
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -24,6 +25,12 @@ import (
 
 const usage = `vctx - switch between several Vault instances by environment variables.
 
+Examples:
+  vctx use prod                    switch this terminal to prod, logging in if needed
+  vault kv get secret/app          plain vault follows (after 'vctx init' once)
+  vctx dev kv get secret/app       one command against dev, without switching
+  vctx check                       which instances are reachable
+
 Usage:
   vctx                             interactive UI: status, switch, login, shell
   vctx <context> [vault args...]   run vault against <context>
@@ -37,11 +44,13 @@ Usage:
   vctx use [<context>]             switch to <context>, logging in if needed
                                    (the UI without a name)
   vctx current                     print the active context
-  vctx ls                          list contexts
-  vctx check [<context>...]        show reachability, version and seal status
+  vctx ls [--json]                 list contexts
+  vctx check [--json] [<ctx>...]   show reachability, version and seal status
   vctx logout [<context>]          forget the stored token of <context>, or
                                    in a context shell the one vault uses
   vctx version                     print the vctx version
+
+'vctx <command> -h' shows the help of a command.
 
 The context is taken from the explicit name, then $VCTX_CONTEXT,
 then the default set by 'vctx use'.
@@ -102,6 +111,8 @@ Environment:
 
 In a terminal that does not answer terminal queries (some ssh or serial
 setups), each command can pause for seconds; TERM=dumb avoids it.
+
+Docs and issues: https://github.com/eugene-panin/vctx
 `
 
 type app struct {
@@ -215,8 +226,22 @@ func (a *app) run(args []string) error {
 		return nil
 	}
 
-	switch cmd, rest := args[0], args[1:]; cmd {
+	cmd, rest := args[0], args[1:]
+	if cmd == "list" {
+		cmd = "ls"
+	}
+	if help, ok := commandHelp[cmd]; ok && wantsHelp(rest) {
+		fmt.Fprint(a.stdout, help)
+		return nil
+	}
+	switch cmd {
 	case "help", "-h", "--help":
+		if len(rest) == 1 {
+			if help, ok := commandHelp[rest[0]]; ok {
+				fmt.Fprint(a.stdout, help)
+				return nil
+			}
+		}
 		fmt.Fprint(a.stdout, usage)
 		return nil
 	case "version", "--version":
@@ -225,13 +250,16 @@ func (a *app) run(args []string) error {
 	case "ui":
 		return a.ui()
 	case "ls", "list":
-		if len(rest) > 0 {
-			return usageError("usage: vctx ls")
+		switch {
+		case len(rest) == 0:
+			return a.list(false)
+		case len(rest) == 1 && rest[0] == "--json":
+			return a.list(true)
 		}
-		return a.list()
+		return commandUsage("ls")
 	case "use":
 		if len(rest) > 1 || len(rest) == 1 && strings.HasPrefix(rest[0], "-") {
-			return usageError("usage: vctx use [<context>]")
+			return commandUsage("use")
 		}
 		if len(rest) == 0 {
 			return a.ui()
@@ -255,7 +283,7 @@ func (a *app) run(args []string) error {
 		return nil
 	case "current":
 		if len(rest) > 0 {
-			return usageError("usage: vctx current")
+			return commandUsage("current")
 		}
 		name, err := a.contextName("")
 		if err != nil {
@@ -268,13 +296,14 @@ func (a *app) run(args []string) error {
 	case "init":
 		return a.initShell(rest)
 	case "check":
-		if slices.ContainsFunc(rest, func(arg string) bool { return strings.HasPrefix(arg, "-") }) {
-			return usageError("usage: vctx check [<context>...]")
+		names := slices.DeleteFunc(slices.Clone(rest), func(arg string) bool { return arg == "--json" })
+		if slices.ContainsFunc(names, func(arg string) bool { return strings.HasPrefix(arg, "-") }) {
+			return commandUsage("check")
 		}
-		return a.check(rest)
+		return a.check(names, len(names) < len(rest))
 	case "logout":
 		if len(rest) > 1 || len(rest) == 1 && strings.HasPrefix(rest[0], "-") {
-			return usageError("usage: vctx logout [<context>]")
+			return commandUsage("logout")
 		}
 		store, err := a.tokens()
 		if err != nil {
@@ -283,10 +312,17 @@ func (a *app) run(args []string) error {
 		// In a context shell, forget the token vault would use there, which
 		// may be an address key if VAULT_ADDR was changed by hand.
 		if len(rest) == 0 && a.getenv(environ.Context) != "" {
-			if _, err := a.contextName(""); err != nil {
+			name, err := a.contextName("")
+			if err != nil {
 				return err
 			}
-			return store.Del(token.Key(a.environ))
+			key := token.Key(a.environ)
+			what := "the token of " + name
+			if key != name {
+				addr, _ := config.AddrFrom(a.getenv)
+				what = "the token for " + config.RedactAddr(config.NormalizeAddr(addr))
+			}
+			return a.forget(store, key, what)
 		}
 		var arg string
 		if len(rest) == 1 {
@@ -306,23 +342,46 @@ func (a *app) run(args []string) error {
 				return errors.Join(fmt.Errorf("unknown context %q", name), err)
 			}
 		}
-		return store.Del(name)
+		return a.forget(store, name, "the token of "+name)
 	case "exec":
 		name, argv := splitExec(rest)
 		if len(argv) == 0 {
-			return usageError("usage: vctx exec [<context>] -- command [args...]")
+			return commandUsage("exec")
 		}
 		return a.execIn(name, argv)
 	default:
 		cfg, err := a.loadConfig()
 		if err != nil {
+			if s := suggest(cmd, commands); s != "" {
+				return usageError(fmt.Sprintf("unknown command %q, did you mean %q?", cmd, s))
+			}
 			return err
 		}
 		if _, ok := cfg.Contexts[cmd]; !ok {
+			if s := suggest(cmd, append(slices.Sorted(maps.Keys(cfg.Contexts)), commands...)); s != "" {
+				return usageError(fmt.Sprintf("unknown command or context %q, did you mean %q?", cmd, s))
+			}
 			return usageError(fmt.Sprintf("unknown command or context %q, see 'vctx help'", cmd))
 		}
 		return a.execWith(cfg, cmd, append([]string{a.vaultBin()}, rest...))
 	}
+}
+
+// forget deletes the token under key and says whether there was one to forget.
+func (a *app) forget(store token.Store, key, what string) error {
+	_, stored, err := store.Addr(key)
+	if err != nil {
+		return err
+	}
+	if !stored {
+		fmt.Fprintf(a.stderr, "no %s stored\n", strings.TrimPrefix(what, "the "))
+		return nil
+	}
+	if err := store.Del(key); err != nil {
+		return err
+	}
+	fmt.Fprintf(a.stderr, "forgot %s\n", what)
+	return nil
 }
 
 // splitExec splits "[name] [--] cmd args..." into the context name and the command.
@@ -421,7 +480,16 @@ func (a *app) defaultContext() (string, error) {
 	return name, nil
 }
 
-func (a *app) list() error {
+// lsEntry is one context in 'vctx ls --json'; the field names are an interface.
+type lsEntry struct {
+	Name      string `json:"name"`
+	Address   string `json:"address"`
+	Namespace string `json:"namespace"`
+	Token     string `json:"token"`
+	Current   bool   `json:"current"`
+}
+
+func (a *app) list(asJSON bool) error {
 	cfg, err := a.loadConfig()
 	if err != nil {
 		return err
@@ -432,30 +500,51 @@ func (a *app) list() error {
 	if err != nil {
 		fmt.Fprintln(a.stderr, "vctx: token status:", err)
 	}
-	tw := tabwriter.NewWriter(a.stdout, 0, 4, 2, ' ', 0)
+	entries := make([]lsEntry, 0, len(names))
 	for _, name := range names {
 		vars, err := cfg.Vars(name, a.home)
 		if err != nil {
 			return err
 		}
+		entries = append(entries, lsEntry{
+			Name:      name,
+			Address:   config.RedactAddr(config.VaultAddr(vars)),
+			Namespace: vars["VAULT_NAMESPACE"],
+			Token:     tokens[name].String(),
+			Current:   name == current,
+		})
+	}
+	if asJSON {
+		return writeJSON(a.stdout, entries)
+	}
+
+	tw := tabwriter.NewWriter(a.stdout, 0, 4, 2, ' ', 0)
+	if a.stdoutTTY {
+		fmt.Fprintln(tw, "  CONTEXT\tADDRESS\tNAMESPACE\tTOKEN")
+	}
+	for _, e := range entries {
 		mark := " "
-		if name == current {
+		if e.Current {
 			mark = "*"
 		}
-		tok := "-"
-		switch tokens[name] {
-		case token.OK:
-			tok = "token"
-		case token.Stale:
-			tok = "stale"
+		tok := e.Token
+		if tok == "none" {
+			tok = "-"
 		}
-		ns := vars["VAULT_NAMESPACE"]
+		ns := e.Namespace
 		if ns == "" {
 			ns = "-"
 		}
-		fmt.Fprintf(tw, "%s %s\t%s\t%s\t%s\n", mark, name, config.RedactAddr(config.VaultAddr(vars)), ns, tok)
+		fmt.Fprintf(tw, "%s %s\t%s\t%s\t%s\n", mark, e.Name, e.Address, ns, tok)
 	}
 	return tw.Flush()
+}
+
+// writeJSON prints v as one indented JSON document.
+func writeJSON(w io.Writer, v any) error {
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	return enc.Encode(v)
 }
 
 func (a *app) use(cfg *config.Config, name string) error {
@@ -491,11 +580,11 @@ func (a *app) env(args []string) error {
 		case !strings.HasPrefix(arg, "-") && name == "":
 			name = arg
 		default:
-			return usageError("usage: vctx env [<context> | --default | --clear] [--shell posix|fish]")
+			return commandUsage("env")
 		}
 	}
 	if clear && (name != "" || fromDefault) || name != "" && fromDefault {
-		return usageError("usage: vctx env [<context> | --default | --clear] [--shell posix|fish]")
+		return commandUsage("env")
 	}
 	write := environ.WritePOSIX
 	if fish {

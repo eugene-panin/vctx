@@ -2,6 +2,7 @@ package cli
 
 import (
 	"crypto/tls"
+	"encoding/json"
 	"io"
 	"log"
 	"net/http"
@@ -225,5 +226,26 @@ func TestUnparsableAddressRedacted(t *testing.T) {
 		if strings.Contains(out.String(), "s3cret") {
 			t.Errorf("%v shows the password:\n%s", args, out)
 		}
+	}
+}
+
+func TestCheckJSON(t *testing.T) {
+	a, out, _ := newTestApp(t)
+	writeContexts(t, a, map[string]string{
+		"active": vaulttest.Serve(t, vaulttest.Handler(200, vaulttest.ActiveBody)),
+		"down":   vaulttest.ClosedURL(t),
+	})
+	a.stdoutTTY = true // JSON regardless of the terminal
+	err := a.run([]string{"check", "--json"})
+	if err == nil || !strings.Contains(err.Error(), "1 of 2") {
+		t.Errorf("err = %v", err)
+	}
+	var got []checkEntry
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("%v:\n%s", err, out)
+	}
+	if len(got) != 2 || got[0].Name != "active" || !got[0].Usable || got[0].Version != "1.20.4" || got[0].LatencyMS == nil ||
+		got[1].Name != "down" || got[1].Usable || got[1].LatencyMS != nil || !strings.Contains(got[1].Status, "unreachable") {
+		t.Errorf("got %+v", got)
 	}
 }

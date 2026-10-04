@@ -42,7 +42,8 @@ func (a *app) ensureReachable(name string, env []string) error {
 		_, long := probe.Classify(err)
 		return fmt.Errorf("context %s: %s", name, long)
 	}
-	r := probe.Probe(context.Background(), t, env, timeout)
+	var r probe.Result
+	a.spin(fmt.Sprintf("checking %s at %s", name, t), func() { r = probe.Probe(context.Background(), t, env, timeout) })
 	if r.Err == nil || probe.IsTLSError(r.Err) {
 		return nil
 	}
@@ -54,8 +55,19 @@ func (a *app) ensureReachable(name string, env []string) error {
 		name, t, long, probe.NetworkHint(t.IsUnix()))
 }
 
-// check probes the given contexts, or all of them, and prints a status table.
-func (a *app) check(args []string) error {
+// checkEntry is one context in 'vctx check --json'; the field names are an interface.
+type checkEntry struct {
+	Name      string `json:"name"`
+	Endpoint  string `json:"endpoint"`
+	Usable    bool   `json:"usable"`
+	Status    string `json:"status"`
+	Version   string `json:"version"`
+	LatencyMS *int64 `json:"latency_ms"`
+}
+
+// check probes the given contexts, or all of them, and prints a status table,
+// or JSON with asJSON.
+func (a *app) check(args []string, asJSON bool) error {
 	cfg, err := a.loadConfig()
 	if err != nil {
 		return err
@@ -83,11 +95,29 @@ func (a *app) check(args []string) error {
 		statuses[i] = ps[i].Status
 	}
 
-	if a.stdoutTTY {
+	switch {
+	case asJSON:
+		entries := make([]checkEntry, len(statuses))
+		for i, s := range statuses {
+			text, lvl := s.Summary()
+			e := checkEntry{Name: s.Name, Endpoint: s.Endpoint, Usable: lvl == probe.OK, Status: text}
+			if s.Health != nil {
+				e.Version = s.Health.Version
+			}
+			if s.Err == nil {
+				ms := max(s.Latency.Milliseconds(), 1)
+				e.LatencyMS = &ms
+			}
+			entries[i] = e
+		}
+		if err := writeJSON(a.stdout, entries); err != nil {
+			return err
+		}
+	case a.stdoutTTY:
 		current, _ := a.contextName("")
 		tokens, tokenErr := a.tokenStatus(cfg, names)
 		fmt.Fprintln(a.stdout, table.Render(a.stdout, statuses, current, tokens, tokenErr))
-	} else {
+	default:
 		tw := tabwriter.NewWriter(a.stdout, 0, 4, 2, ' ', 0)
 		for _, s := range statuses {
 			text, lvl := s.Summary()
@@ -110,13 +140,17 @@ func (a *app) check(args []string) error {
 	switch {
 	case failed == 0:
 		return nil
-	case a.stdoutTTY:
+	case a.stdoutTTY && !asJSON:
 		return errSilent
 	}
 	return fmt.Errorf("%d of %d contexts not usable", failed, len(names))
 }
 
-// spin runs fn, animating a spinner on stderr when it is a terminal.
+// spinDelay keeps quick operations from flashing a spinner.
+const spinDelay = 300 * time.Millisecond
+
+// spin runs fn, animating a spinner on stderr when it is a terminal and fn
+// takes longer than spinDelay.
 func (a *app) spin(title string, fn func()) {
 	if !a.stderrTTY {
 		fn()
@@ -127,6 +161,11 @@ func (a *app) spin(title string, fn func()) {
 	done := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Go(func() {
+		select {
+		case <-done:
+			return
+		case <-time.After(spinDelay):
+		}
 		frames := []rune("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
 		tick := time.NewTicker(80 * time.Millisecond)
 		defer tick.Stop()

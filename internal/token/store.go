@@ -247,6 +247,17 @@ const (
 	Stale       // stored for another address, or without one: vault will not get it
 )
 
+// String is the state as 'vctx ls --json' reports it.
+func (s State) String() string {
+	switch s {
+	case OK:
+		return "ok"
+	case Stale:
+		return "stale"
+	}
+	return "none"
+}
+
 // Status reports the stored token of each context; on error the map still
 // holds every answer that could be got.
 func Status(s Store, cfg *config.Config, home string, names []string) (map[string]State, error) {
