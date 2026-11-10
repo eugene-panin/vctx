@@ -203,15 +203,24 @@ func Announce(osEnv []string, name string) {
 	if path == "" {
 		return
 	}
-	// The function created the file; vctx only fills it.
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0)
+	// The function created the file; vctx only fills it. O_NOFOLLOW so a
+	// symlink is not truncated before the check, and the owner must be us.
+	f, err := os.OpenFile(path, os.O_WRONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return
 	}
 	defer f.Close()
-	if fi, err := f.Stat(); err == nil && fi.Mode().IsRegular() {
-		_, _ = io.WriteString(f, name)
+	fi, err := f.Stat()
+	if err != nil || !fi.Mode().IsRegular() {
+		return
 	}
+	if st, ok := fi.Sys().(*syscall.Stat_t); !ok || int(st.Uid) != os.Getuid() {
+		return
+	}
+	if err := f.Truncate(0); err != nil {
+		return
+	}
+	_, _ = io.WriteString(f, name)
 }
 
 // Integrated reports whether the shell function called vctx.

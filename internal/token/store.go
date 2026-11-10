@@ -46,7 +46,32 @@ type fileStore struct{ dir string }
 
 func (s fileStore) path(key string) string { return filepath.Join(s.dir, filepath.FromSlash(key)) }
 
+// privateDir allows a missing directory and refuses one others could modify.
+func privateDir(dir string) error {
+	fi, err := os.Stat(dir)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return safefile.CheckPrivate(dir, fi)
+}
+
+// guard checks the state directory and this store's own directory. The token
+// helper runs without the check writeVaultConfig does, and a directory others
+// can write lets them replace the token file.
+func (s fileStore) guard() error {
+	if err := privateDir(filepath.Dir(s.dir)); err != nil {
+		return err
+	}
+	return privateDir(s.dir)
+}
+
 func (s fileStore) Get(key string) (string, string, bool, error) {
+	if err := s.guard(); err != nil {
+		return "", "", false, err
+	}
 	b, err := os.ReadFile(s.path(key))
 	if errors.Is(err, fs.ErrNotExist) {
 		return "", "", false, nil
@@ -64,10 +89,16 @@ func (s fileStore) Addr(key string) (string, bool, error) {
 }
 
 func (s fileStore) Set(key, token, addr string) error {
+	if err := s.guard(); err != nil {
+		return err
+	}
 	return safefile.Write(s.path(key), []byte(encodeToken(token, addr)), 0o600)
 }
 
 func (s fileStore) Del(key string) error {
+	if err := s.guard(); err != nil {
+		return err
+	}
 	if err := os.Remove(s.path(key)); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}
@@ -140,7 +171,17 @@ func (s keychainStore) addrPath(key string) string {
 	return filepath.Join(s.addrDir, filepath.FromSlash(key))
 }
 
+func (s keychainStore) guard() error {
+	if err := s.legacy.guard(); err != nil {
+		return err
+	}
+	return privateDir(s.addrDir)
+}
+
 func (s keychainStore) Get(key string) (string, string, bool, error) {
+	if err := s.guard(); err != nil {
+		return "", "", false, err
+	}
 	v, err := s.kr.Get(keyringService, key)
 	switch {
 	case err == nil:
@@ -153,6 +194,9 @@ func (s keychainStore) Get(key string) (string, string, bool, error) {
 }
 
 func (s keychainStore) Addr(key string) (string, bool, error) {
+	if err := s.guard(); err != nil {
+		return "", false, err
+	}
 	ok, err := s.kr.Has(keyringService, key)
 	switch {
 	case err != nil:
@@ -172,24 +216,34 @@ func (s keychainStore) Addr(key string) (string, bool, error) {
 	return addr, ok, err
 }
 
-// Set records the address first and puts the old record back if the keychain
-// refuses the token, so the record never describes a token that is not there.
+// Set stores the secret first and the address file after it. The other order
+// published the new address while the keychain still held the old token, and
+// status trusted the file. If the keychain refuses the token, the address
+// file is left as it was. If the address file cannot be written, the previous
+// secret is put back.
 func (s keychainStore) Set(key, token, addr string) error {
-	path := s.addrPath(key)
-	old, oldErr := os.ReadFile(path)
-	if err := safefile.Write(path, []byte(addr+"\n"), 0o600); err != nil {
+	if err := s.guard(); err != nil {
 		return err
 	}
+	prev, prevErr := s.kr.Get(keyringService, key)
+	had := prevErr == nil
+	if prevErr != nil && !errors.Is(prevErr, keyring.ErrNotFound) {
+		return keychainError(prevErr)
+	}
 	if err := s.kr.Set(keyringService, key, encodeToken(token, addr)); err != nil {
-		if oldErr == nil {
-			_ = safefile.Write(path, old, 0o600)
-		} else {
-			_ = os.Remove(path)
-		}
 		if errors.Is(err, keyring.ErrSetDataTooBig) {
 			return fmt.Errorf("token too long for the keychain, set VCTX_TOKEN_STORE=file to use files: %w", err)
 		}
 		return keychainError(err)
+	}
+	path := s.addrPath(key)
+	if err := safefile.Write(path, []byte(addr+"\n"), 0o600); err != nil {
+		if had {
+			_ = s.kr.Set(keyringService, key, prev)
+		} else {
+			_ = s.kr.Delete(keyringService, key)
+		}
+		return err
 	}
 	if err := s.removeOldRecord(key); err != nil {
 		return err
@@ -198,6 +252,9 @@ func (s keychainStore) Set(key, token, addr string) error {
 }
 
 func (s keychainStore) Del(key string) error {
+	if err := s.guard(); err != nil {
+		return err
+	}
 	if err := s.kr.Delete(keyringService, key); err != nil && !errors.Is(err, keyring.ErrNotFound) {
 		return keychainError(err)
 	}

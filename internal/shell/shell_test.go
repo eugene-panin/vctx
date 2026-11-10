@@ -74,6 +74,33 @@ func TestInstallFindsHandWrittenLine(t *testing.T) {
 	}
 }
 
+func TestChoiceFileSkipsSymlink(t *testing.T) {
+	dir := t.TempDir()
+	secret := filepath.Join(dir, "secret")
+	if err := os.WriteFile(secret, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "choice")
+	if err := os.Symlink(secret, link); err != nil {
+		t.Fatal(err)
+	}
+	Announce([]string{"VCTX_CHOICE_FILE=" + link}, "dev")
+	if b, err := os.ReadFile(secret); err != nil || string(b) != "keep" {
+		t.Fatalf("symlink target = %q, %v", b, err)
+	}
+}
+
+func TestChoiceFileWritesRegularFile(t *testing.T) {
+	choice := filepath.Join(t.TempDir(), "choice")
+	if err := os.WriteFile(choice, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	Announce([]string{"VCTX_CHOICE_FILE=" + choice}, "dev")
+	if b, err := os.ReadFile(choice); err != nil || string(b) != "dev" {
+		t.Fatalf("choice = %q, %v", b, err)
+	}
+}
+
 func TestBashProfileOnMacKeepsExistingProfile(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("macOS login shells only")

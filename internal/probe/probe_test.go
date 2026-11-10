@@ -11,7 +11,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/eugene-panin/vctx/internal/vaulttest"
 )
@@ -71,6 +73,33 @@ func TestRedirectReported(t *testing.T) {
 	short, long := Classify(r.Err)
 	if short != "blocked (HTTP 302)" || !strings.Contains(long, "redirect to sso.example.com") {
 		t.Errorf("short %q, long %q", short, long)
+	}
+}
+
+func TestRedirectWithHealthBodyIsNotVault(t *testing.T) {
+	body := []byte(`{"initialized":true,"sealed":false,"standby":false,"version":"1.20.4"}`)
+	addr := vaulttest.Serve(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", "https://login.evil.example/sso")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusFound)
+		_, _ = w.Write(body)
+	}))
+	r := probeEnv(t, []string{"VAULT_ADDR=" + addr})
+	short, long := Classify(r.Err)
+	if r.Health != nil || short != "blocked (HTTP 302)" || !strings.Contains(long, "login.evil.example") {
+		t.Fatalf("health %v short %q long %q", r.Health, short, long)
+	}
+}
+
+func TestCAReadStopsOnFIFO(t *testing.T) {
+	fifo := filepath.Join(t.TempDir(), "ca.pem")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	r := Probe(t.Context(), Target{}, []string{"VAULT_CACERT=" + fifo}, 200*time.Millisecond)
+	if r.Err == nil || time.Since(start) > time.Second {
+		t.Fatalf("err=%v after %s", r.Err, time.Since(start))
 	}
 }
 

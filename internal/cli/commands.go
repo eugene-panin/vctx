@@ -76,7 +76,8 @@ Environment:
                       VCTX_VARS, VCTX_SAVED_*)
   NO_COLOR            no colors (also --no-color)
 
-Exit status: 0 on success, 1 on failure, 2 for a malformed command line.
+Exit status: 0 on success, 1 on failure, 2 for a malformed command line,
+130 when interrupted.
 
 Docs and issues: https://github.com/eugene-panin/vctx`
 
@@ -432,10 +433,11 @@ func (a *app) switchTo(name string) error {
 	}
 	shell.Announce(a.environ, name)
 	a.printUsing(name, cfg)
-	if errors.Is(a.loginRunner(timeout).Ensure(ctx, cfg, name), login.ErrCancelled) {
+	err = a.loginRunner(timeout).Ensure(ctx, cfg, name)
+	if errors.Is(err, login.ErrCancelled) {
 		return errInterrupted
 	}
-	return nil
+	return err
 }
 
 // runContext is 'vctx <name> [vault args...]'.

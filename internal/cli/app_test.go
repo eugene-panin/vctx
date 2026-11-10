@@ -321,6 +321,8 @@ func TestAddressFlagRefused(t *testing.T) {
 		{"dev", "login", "-address", "http://other"},
 		{"dev", "kv", "get", "--agent-address=http://other", "x"},
 		{"exec", "dev", "--", "vault", "-address=http://other", "status"},
+		{"exec", "dev", "--", "vault-1.15", "-address=http://other", "status"},
+		{"exec", "dev", "--", "/usr/bin/env", "vault", "-address=http://other", "status"},
 	} {
 		*call = execCall{}
 		if err := a.run(args); err == nil || !strings.Contains(err.Error(), "another server") || call.argv0 != "" {
@@ -343,6 +345,32 @@ func TestAddrFromDefaults(t *testing.T) {
 	}
 	if strings.Count(out.String(), "https://vault.example.com") != 2 {
 		t.Errorf("ls:\n%s", out)
+	}
+}
+
+func TestAddressFlagLeftForOtherCommands(t *testing.T) {
+	a, _, call := newTestApp(t)
+	if err := a.run([]string{"exec", "dev", "--", "/bin/echo", "-address=http://other"}); err != nil || call.argv0 != "/bin/echo" {
+		t.Fatalf("err %v, ran %q", err, call.argv0)
+	}
+}
+
+func TestUseReportsKeychainFailure(t *testing.T) {
+	a, _, _ := newTestApp(t, "VCTX_TOKEN_STORE=keychain")
+	err := a.run([]string{"use", "dev"})
+	if err == nil || !strings.Contains(err.Error(), "keychain") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestListReportsKeychainFailure(t *testing.T) {
+	a, out, _ := newTestApp(t, "VCTX_TOKEN_STORE=keychain")
+	err := a.run([]string{"ls", "--json"})
+	if err == nil || !strings.Contains(err.Error(), "keychain") {
+		t.Fatalf("err = %v", err)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("ls wrote %s", out.Bytes())
 	}
 }
 

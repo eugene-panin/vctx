@@ -146,9 +146,35 @@ func hostPort(u *url.URL) string {
 	return net.JoinHostPort(u.Hostname(), port)
 }
 
+// maxPEM is how much of a CA or client certificate file a probe will read.
+const maxPEM = 1 << 20
+
+// readLimited reads path, stopping at maxPEM. The open is non-blocking: a FIFO
+// with no writer would otherwise sit in Open until a peer appears, and the
+// HTTP client, which carries the probe timeout, does not exist yet. /dev/zero
+// stops at maxPEM instead of growing without a bound.
+func readLimited(ctx context.Context, path string) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	b, err := io.ReadAll(io.LimitReader(f, maxPEM+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(b) > maxPEM {
+		return nil, fmt.Errorf("%s is larger than %d bytes", path, maxPEM)
+	}
+	return b, nil
+}
+
 // tlsConfig mirrors the TLS variables the Vault CLI understands, with the same
 // precedence for CA certificates: file, then inline PEM, then directory.
-func tlsConfig(env []string) (*tls.Config, error) {
+func tlsConfig(ctx context.Context, env []string) (*tls.Config, error) {
 	cfg := &tls.Config{
 		MinVersion: tls.VersionTLS12,
 		ServerName: environ.Value(env, "VAULT_TLS_SERVER_NAME"),
@@ -160,7 +186,7 @@ func tlsConfig(env []string) (*tls.Config, error) {
 	var pems [][]byte
 	switch file, inline, dir := environ.Value(env, "VAULT_CACERT"), environ.Value(env, "VAULT_CACERT_BYTES"), environ.Value(env, "VAULT_CAPATH"); {
 	case file != "":
-		pem, err := os.ReadFile(file)
+		pem, err := readLimited(ctx, file)
 		if err != nil {
 			return nil, fmt.Errorf("read CA certificate: %w", err)
 		}
@@ -176,7 +202,7 @@ func tlsConfig(env []string) (*tls.Config, error) {
 			if e.IsDir() {
 				continue
 			}
-			pem, err := os.ReadFile(filepath.Join(dir, e.Name()))
+			pem, err := readLimited(ctx, filepath.Join(dir, e.Name()))
 			if err != nil {
 				return nil, fmt.Errorf("read CA certificate: %w", err)
 			}
@@ -193,7 +219,15 @@ func tlsConfig(env []string) (*tls.Config, error) {
 	}
 
 	if cert, key := environ.Value(env, "VAULT_CLIENT_CERT"), environ.Value(env, "VAULT_CLIENT_KEY"); cert != "" && key != "" {
-		pair, err := tls.LoadX509KeyPair(cert, key)
+		certPEM, err := readLimited(ctx, cert)
+		if err != nil {
+			return nil, fmt.Errorf("load client certificate: %w", err)
+		}
+		keyPEM, err := readLimited(ctx, key)
+		if err != nil {
+			return nil, fmt.Errorf("load client certificate: %w", err)
+		}
+		pair, err := tls.X509KeyPair(certPEM, keyPEM)
 		if err != nil {
 			return nil, fmt.Errorf("load client certificate: %w", err)
 		}
@@ -301,8 +335,16 @@ type Result struct {
 
 // Probe calls sys/health on t the way vault would with env. Unauthenticated, read-only.
 func Probe(ctx context.Context, t Target, env []string, timeout time.Duration) Result {
-	tlsCfg, err := tlsConfig(env)
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	tlsCfg, err := tlsConfig(ctx, env)
 	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			return Result{Err: err}
+		}
 		return Result{Err: &configError{err}}
 	}
 	tr := &http.Transport{
@@ -348,6 +390,11 @@ func Probe(ctx context.Context, t Target, env []string, timeout time.Duration) R
 	if err != nil {
 		return Result{Err: err}
 	}
+	// A redirect is never Vault, even when the body happens to parse as
+	// sys/health: CheckRedirect already refused to follow it.
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		return Result{Err: notVault(resp)}
+	}
 	// sys/health signals node state through many status codes (429 standby,
 	// 503 sealed, 474 HA unhealthy, 530 removed, ...); the body tells Vault apart.
 	if h, ok := decodeHealth(body); ok {
@@ -363,14 +410,18 @@ func Probe(ctx context.Context, t Target, env []string, timeout time.Duration) R
 		pe.proxy, pe.status = t.proxy.Host, termsafe.String(resp.Status, 60)
 		return Result{Err: pe}
 	}
-	notVault := &notVaultError{Status: resp.StatusCode, ContentType: termsafe.String(resp.Header.Get("Content-Type"), 40)}
-	if notVault.ContentType == "" {
-		notVault.ContentType = "no content type"
+	return Result{Err: notVault(resp)}
+}
+
+func notVault(resp *http.Response) *notVaultError {
+	nv := &notVaultError{Status: resp.StatusCode, ContentType: termsafe.String(resp.Header.Get("Content-Type"), 40)}
+	if nv.ContentType == "" {
+		nv.ContentType = "no content type"
 	}
 	if loc, err := resp.Location(); err == nil {
-		notVault.Location = termsafe.String(loc.Host, 60)
+		nv.Location = termsafe.String(loc.Host, 60)
 	}
-	return Result{Err: notVault}
+	return nv
 }
 
 // notTLS matches a TLS client talking to a plain HTTP server; net/http reports

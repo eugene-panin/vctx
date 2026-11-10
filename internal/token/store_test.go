@@ -103,6 +103,20 @@ func TestFileStore(t *testing.T) {
 	}
 }
 
+func TestFileStoreRejectsSharedDirectory(t *testing.T) {
+	s, dir := openStore(t, "file", nil)
+	tokens := filepath.Join(dir, "tokens")
+	if err := os.MkdirAll(tokens, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(tokens, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := s.Get("dev"); err == nil || !strings.Contains(err.Error(), "writable") {
+		t.Fatalf("open token directory accepted: %v", err)
+	}
+}
+
 func TestStateSeesAddressChange(t *testing.T) {
 	s, _ := openStore(t, "file", nil)
 	if err := s.Set("dev", "tok", devAddr); err != nil {
@@ -151,6 +165,20 @@ func TestKeychainMigratesLegacyFile(t *testing.T) {
 	}
 }
 
+type orderKeyring struct {
+	*fakeKeyring
+	dir   string
+	early bool
+}
+
+func (o *orderKeyring) Set(service, user, password string) error {
+	b, err := os.ReadFile(filepath.Join(o.dir, "keychain-addrs", user))
+	if err == nil && strings.Contains(string(b), "http://other:8201") {
+		o.early = true
+	}
+	return o.fakeKeyring.Set(service, user, password)
+}
+
 type brokenKeyring struct{ *fakeKeyring }
 
 func (brokenKeyring) Get(string, string) (string, error) { return "", errors.New("keychain locked") }
@@ -189,6 +217,16 @@ func TestKeychainStatusReadsNoSecret(t *testing.T) {
 	}
 	if kr.gets != 0 {
 		t.Errorf("status read the secret %d times", kr.gets)
+	}
+	// The address file is written only after the secret, so a set that dies
+	// inside the keychain cannot publish the new address first.
+	order := &orderKeyring{fakeKeyring: kr, dir: dir}
+	ordered, _ := Open(dir, "keychain", order)
+	if err := ordered.Set("dev", "next", "http://other:8201"); err != nil {
+		t.Fatal(err)
+	}
+	if order.early {
+		t.Error("address file held the new address before the secret was stored")
 	}
 	if err := s.Del("dev"); err != nil {
 		t.Fatal(err)

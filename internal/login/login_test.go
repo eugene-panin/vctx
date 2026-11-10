@@ -388,3 +388,13 @@ func TestNoLoginWithoutTerminal(t *testing.T) {
 		})
 	}
 }
+
+func TestNoLoginReturnsStoreError(t *testing.T) {
+	r, _ := newRunner(t, "/bin/vault")
+	r.Interactive = false
+	r.Tokens = func() (token.Store, error) { return nil, errors.New("keychain locked") }
+	err := r.Ensure(context.Background(), loadConfig(t, "contexts:\n  x:\n    VAULT_ADDR: http://v\n"), "x")
+	if err == nil || !strings.Contains(err.Error(), "keychain locked") {
+		t.Fatalf("err = %v", err)
+	}
+}

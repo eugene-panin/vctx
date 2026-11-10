@@ -184,8 +184,7 @@ func vaultError(out string) string {
 // returns ErrCancelled. With no one to ask it only says what is missing.
 func (r *Runner) Ensure(ctx context.Context, cfg *config.Config, name string) error {
 	if !r.Interactive {
-		r.noLogin(cfg, name)
-		return nil
+		return r.noLogin(cfg, name)
 	}
 	r.ensure(ctx, cfg, name)
 	if ctx.Err() != nil {
@@ -196,18 +195,24 @@ func (r *Runner) Ensure(ctx context.Context, cfg *config.Config, name string) er
 
 // noLogin says so when context name has no token vctx could use, and there is
 // no one to log in: otherwise vault fails later with a bare 403.
-func (r *Runner) noLogin(cfg *config.Config, name string) {
+func (r *Runner) noLogin(cfg *config.Config, name string) error {
 	vars, err := cfg.Vars(name, r.Home)
-	if err != nil || vars["VAULT_AGENT_ADDR"] != "" || vars["VAULT_TOKEN"] != "" || vars["VAULT_CONFIG_PATH"] != "" {
-		return // vctx's store does not decide these
+	if err != nil {
+		return err
+	}
+	if vars["VAULT_AGENT_ADDR"] != "" || vars["VAULT_TOKEN"] != "" || vars["VAULT_CONFIG_PATH"] != "" {
+		return nil // vctx's store does not decide these
 	}
 	store, err := r.Tokens()
 	if err != nil {
-		return
+		return err
 	}
 	state, err := token.StateOf(store, cfg, r.Home, name)
-	if err != nil || state == token.OK {
-		return
+	if err != nil {
+		return err
+	}
+	if state == token.OK {
+		return nil
 	}
 	what := "has no token yet"
 	if state == token.Stale {
@@ -219,6 +224,7 @@ func (r *Runner) noLogin(cfg *config.Config, name string) {
 	}
 	p := style.New(r.Out, r.colorEnv())
 	fmt.Fprintln(r.Out, p.Warn.Render(fmt.Sprintf("  %s %s; not logging in (%s): 'vctx use %s' in a terminal logs in", name, what, why, name)))
+	return nil
 }
 
 func (r *Runner) ensure(ctx context.Context, cfg *config.Config, name string) {

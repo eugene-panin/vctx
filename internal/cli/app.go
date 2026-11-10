@@ -210,6 +210,21 @@ func (a *app) forget(store token.Store, key, what string) error {
 // addressFlag returns a vault flag that points vault at another server than the
 // context's. The token helper sees only the environment, not flags, so it would
 // hand the context's token to that server.
+// runsVault reports a command that will execute vault, including a renamed
+// binary (vault-1.15) and a wrapper (env, sudo) whose arguments do.
+func runsVault(argv0, vaultBin string) bool {
+	base := strings.TrimSuffix(strings.ToLower(filepath.Base(argv0)), ".exe")
+	own := strings.TrimSuffix(strings.ToLower(filepath.Base(vaultBin)), ".exe")
+	if base == "vault" || base == own || strings.HasPrefix(base, "vault-") || strings.HasPrefix(base, "vault_") {
+		return true
+	}
+	switch base {
+	case "env", "sudo", "doas":
+		return true
+	}
+	return false
+}
+
 func addressFlag(args []string) string {
 	for _, arg := range args {
 		if arg == "--" {
@@ -301,7 +316,7 @@ func (a *app) list(asJSON bool) error {
 	names := slices.Sorted(maps.Keys(cfg.Contexts))
 	tokens, err := a.tokenStatus(cfg, names)
 	if err != nil {
-		fmt.Fprintln(a.stderr, "vctx: token status:", err)
+		return fmt.Errorf("token status: %w", err)
 	}
 	entries := make([]lsEntry, 0, len(names))
 	for _, name := range names {
@@ -416,7 +431,7 @@ func (a *app) execIn(arg string, argv []string) error {
 }
 
 func (a *app) execWith(cfg *config.Config, name string, argv []string) error {
-	if bin := filepath.Base(argv[0]); bin == "vault" || bin == filepath.Base(a.vaultBin()) {
+	if runsVault(argv[0], a.vaultBin()) {
 		if flag := addressFlag(argv[1:]); flag != "" {
 			return fmt.Errorf("%s would send the %s token to another server; set the address in the context instead", flag, name)
 		}
